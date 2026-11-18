@@ -54,7 +54,7 @@ class OcrError(Exception):
 # --------------------------------------------------------------------------- окружение
 
 def tesseract_available() -> bool:
-    return shutil.which(settings.tesseract_cmd) is not None
+    return settings.ocr_enabled and shutil.which(settings.tesseract_cmd) is not None
 
 
 @lru_cache(maxsize=1)

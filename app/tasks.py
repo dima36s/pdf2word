@@ -32,8 +32,24 @@ ACTIVE = ("queued", "processing")
 
 class TaskStore:
     def __init__(self, root: Path):
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = self._writable(root)
+
+    @staticmethod
+    def _writable(root: Path) -> Path:
+        """DATA_DIR может оказаться недоступен для записи (хостинг запускает контейнер под другим
+        uid, OpenShift и т.п.) — тогда работаем во временном каталоге."""
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / ".write-test"
+            probe.write_text("ok")
+            probe.unlink()
+            return root
+        except OSError as exc:
+            import tempfile
+            fallback = Path(tempfile.gettempdir()) / "pdf2word" / "tasks"
+            fallback.mkdir(parents=True, exist_ok=True)
+            log.warning("DATA_DIR %s недоступен для записи (%s), использую %s", root, exc, fallback)
+            return fallback
 
     # ------------------------------------------------------------------ пути
     @staticmethod

@@ -35,6 +35,11 @@ class Settings:
     ocr_dpi: int = field(default_factory=lambda: _int("OCR_DPI", 300))
     ocr_default_lang: str = field(default_factory=lambda: os.environ.get("OCR_DEFAULT_LANG", "rus+eng"))
     tesseract_cmd: str = field(default_factory=lambda: os.environ.get("TESSERACT_CMD", "tesseract"))
+    # OCR можно выключить на слабых серверах (распознавание требует ~600 МБ памяти)
+    ocr_enabled: bool = field(default_factory=lambda: os.environ.get("OCR_ENABLED", "1").lower()
+                              not in ("0", "false", "no", "off"))
+    # Плашка-предупреждение в интерфейсе (для публичных тестовых стендов)
+    demo_notice: str = field(default_factory=lambda: os.environ.get("DEMO_NOTICE", "").strip())
 
     @property
     def max_file_bytes(self) -> int:

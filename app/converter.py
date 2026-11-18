@@ -121,7 +121,7 @@ def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn
         work = doc
         if scans and opts.ocr != "off":
             if not ocr.tesseract_available():
-                stats.warnings.append("Распознавание текста (OCR) недоступно на сервере — "
+                stats.warnings.append("Распознавание текста (OCR) на этом сервере отключено — "
                                       "отсканированные страницы вставлены как изображения.")
             else:
                 lang = ocr.resolve_lang(opts.ocr_lang)

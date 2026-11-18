@@ -1,10 +1,13 @@
 {
   "name": "PDF → Word",
   "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
   "hostRequirements": { "cpus": 2, "memory": "4gb" },
   "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus tesseract-ocr-osd fonts-liberation && pip install -r requirements.txt pytest httpx",
   "postAttachCommand": {
-    "server": "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    "server": "bash .devcontainer/start.sh"
   },
   "forwardPorts": [8000],
   "portsAttributes": {

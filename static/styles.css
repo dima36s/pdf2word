@@ -41,6 +41,10 @@ svg { width: 1.2em; height: 1.2em; flex: none; }
 .brand-arrow { color: var(--accent); margin: 0 3px; }
 .pill { font-size: 13px; color: var(--muted); background: var(--bg); border: 1px solid var(--line); padding: 5px 11px; border-radius: 99px; }
 
+.notice {
+  background: var(--warn-50); color: var(--warn); border-bottom: 1px solid #f6d7a7;
+  text-align: center; font-size: 14px; line-height: 1.4; padding: 9px 20px;
+}
 main { flex: 1; width: 100%; max-width: 1240px; margin: 0 auto; padding: 0 24px 48px; }
 
 /* ---------- кнопки ---------- */

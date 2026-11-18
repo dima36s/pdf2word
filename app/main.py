@@ -52,7 +52,7 @@ async def lifespan(_app: FastAPI):
     store.recover_after_restart()
     runner = Runner(store, settings.workers, settings.convert_timeout)
     cleaner = asyncio.create_task(_cleanup_loop())
-    log.info("PDF→Word %s: data=%s workers=%d ocr=%s", __version__, settings.data_dir, settings.workers,
+    log.info("PDF→Word %s: data=%s workers=%d ocr=%s", __version__, store.root, settings.workers,
              ocr.tesseract_available())
     try:
         yield
@@ -125,6 +125,7 @@ def get_config() -> dict:
         "max_file_mb": settings.max_file_mb,
         "max_pages": settings.max_pages,
         "file_ttl_min": settings.file_ttl_min,
+        "notice": settings.demo_notice or None,
         "ocr": {
             "available": ocr.tesseract_available() and bool(langs),
             "default": default,

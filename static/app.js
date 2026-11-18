@@ -67,6 +67,11 @@
       state.cfg = { max_file_mb: 100, file_ttl_min: 60, ocr: { available: false, languages: [] } };
     }
     const c = state.cfg;
+    if (c.notice) {
+      const n = $("#notice");
+      n.textContent = c.notice;
+      n.hidden = false;
+    }
     el.limits.textContent = `PDF до ${c.max_file_mb} МБ` + (c.max_pages ? ` и ${c.max_pages} страниц` : "");
     el.ttlPill.textContent = `Файлы хранятся ${c.file_ttl_min} мин`;
     el.ttlPill.hidden = false;
@@ -89,7 +94,7 @@
       el.ocr.checked = false;
       el.ocr.disabled = true;
       el.langField.hidden = true;
-      el.ocrHelp.textContent = "Распознавание текста на сервере не настроено: отсканированные страницы будут вставлены картинками.";
+      el.ocrHelp.textContent = "Распознавание сканов на этом сервере отключено: отсканированные страницы будут вставлены в Word картинками.";
     }
   }
   el.ocr.addEventListener("change", () => { el.langField.hidden = !el.ocr.checked; });
