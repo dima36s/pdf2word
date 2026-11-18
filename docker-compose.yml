@@ -1,0 +1,22 @@
+services:
+  pdf2word:
+    build: .
+    image: pdf2word:latest
+    container_name: pdf2word
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MAX_FILE_MB: "100"          # максимальный размер PDF
+      MAX_PAGES: "500"            # максимальное число страниц
+      CONVERT_WORKERS: "2"        # одновременных конвертаций
+      CONVERT_TIMEOUT: "900"      # секунд на одну конвертацию
+      FILE_TTL_MIN: "60"          # через сколько минут удалять файлы
+      OCR_DEFAULT_LANG: "rus+eng"
+      WORKER_MEMORY_MB: "3072"    # лимит памяти одного процесса конвертации (0 — без лимита)
+    volumes:
+      - pdf2word-data:/data
+    mem_limit: 8g
+
+volumes:
+  pdf2word-data:

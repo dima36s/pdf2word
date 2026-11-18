@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: Тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Tesseract и шрифты
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus tesseract-ocr-osd fonts-liberation
+      - name: Зависимости
+        run: pip install -r requirements.txt pytest httpx
+      - name: pytest
+        run: pytest -q
+
+  docker:
+    name: Docker-образ
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # загрузка файлов в релиз по тегу
+      packages: write   # публикация образа в GHCR
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Сборка
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pdf2word:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Проверка образа (конвертация скана с OCR)
+        run: |
+          docker run -d --name p2w -p 8000:8000 pdf2word:ci
+          for i in $(seq 40); do curl -sf localhost:8000/healthz && break; sleep 2; done
+          ID=$(curl -sf -F "file=@tests/samples/scan_color.pdf;type=application/pdf" localhost:8000/api/tasks | jq -r .id)
+          curl -sf -X POST -H 'Content-Type: application/json' -d '{"ocr":"auto"}' localhost:8000/api/tasks/$ID/convert > /dev/null
+          for i in $(seq 90); do
+            S=$(curl -sf localhost:8000/api/tasks/$ID | jq -r .status)
+            [ "$S" = done ] && break
+            [ "$S" = error ] && { curl -s localhost:8000/api/tasks/$ID; docker logs p2w; exit 1; }
+            sleep 2
+          done
+          curl -sf localhost:8000/api/tasks/$ID | jq .stats
+          curl -sf -o result.docx localhost:8000/api/tasks/$ID/download
+          file result.docx | grep -q "Microsoft Word"
+          docker rm -f p2w
+
+      - name: Вход в GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Публикация образа
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          TAGS="latest sha-${GITHUB_SHA::7}"
+          [[ "$GITHUB_REF" == refs/tags/v* ]] && TAGS="$TAGS ${GITHUB_REF_NAME}"
+          for t in $TAGS; do docker tag pdf2word:ci "$IMAGE:$t"; docker push "$IMAGE:$t"; done
+
+      - name: Комплект для закрытого контура
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          V=${GITHUB_REF_NAME}
+          docker tag pdf2word:ci pdf2word:$V
+          docker save pdf2word:$V | gzip -6 > pdf2word-$V-docker-image.tar.gz
+          # Python-колёса для установки без интернета (Linux x86_64, Python 3.12)
+          python3 -m pip download -r requirements.txt -d wheels --only-binary=:all: \
+            --platform manylinux2014_x86_64 --platform manylinux_2_28_x86_64 --python-version 3.12
+          tar czf pdf2word-$V-wheels-py312-linux-x86_64.tar.gz wheels requirements.txt
+          sha256sum pdf2word-$V-*.tar.gz > SHA256SUMS.txt
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pdf2word-*-docker-image.tar.gz
+            pdf2word-*-wheels-*.tar.gz
+            SHA256SUMS.txt
+          body: |
+            Комплект для установки без доступа в интернет — см. docs/DEPLOY-CORP.md.
+            * `pdf2word-${{ github.ref_name }}-docker-image.tar.gz` — образ: `docker load -i …`
+            * `pdf2word-…-wheels-…tar.gz` — Python-пакеты: `pip install --no-index --find-links wheels -r requirements.txt`

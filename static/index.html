@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF в Word — конвертер с сохранением структуры</title>
+  <meta name="description" content="Конвертируйте PDF в редактируемый документ Word (DOCX) с сохранением текста, таблиц, изображений и колонок. Распознавание сканов.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232b579a'/%3E%3Cpath d='M8 9h3l2 9 2.4-9h2.2L20 18l2-9h3l-3.6 14h-2.8L16.3 14l-2.4 9h-2.8z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="На главную">
+      <span class="brand-logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M8 9h3l2 9 2.4-9h2.2L20 18l2-9h3l-3.6 14h-2.8L16.3 14l-2.4 9h-2.8z" fill="#fff"/></svg>
+      </span>
+      <span class="brand-name">PDF<span class="brand-arrow">→</span>Word</span>
+    </a>
+    <nav class="topnav">
+      <span class="pill" id="ttlPill" hidden></span>
+    </nav>
+  </header>
+
+  <main id="app">
+    <!-- Стартовый экран -->
+    <section class="hero" id="hero">
+      <h1>Конвертировать PDF в Word</h1>
+      <p class="lead">Преобразуйте PDF в редактируемый документ DOCX с&nbsp;сохранением форматирования:
+        абзацы, шрифты, таблицы, изображения, колонки и&nbsp;колонтитулы. Сканы распознаются автоматически.</p>
+      <div class="drop" id="dropZone">
+        <button class="btn btn-xl btn-primary" id="pickBtn" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Выбрать PDF файлы
+        </button>
+        <p class="drop-hint">или перетащите PDF сюда</p>
+        <p class="drop-limits" id="limits"></p>
+      </div>
+      <ul class="features">
+        <li><span class="fi" aria-hidden="true">▦</span><b>Таблицы и колонки</b><small>Ячейки, объединения, многоколоночная вёрстка</small></li>
+        <li><span class="fi" aria-hidden="true">◎</span><b>Распознавание сканов</b><small>OCR, выравнивание наклона, жирный и цвет</small></li>
+        <li><span class="fi" aria-hidden="true">🔒</span><b>PDF с паролем</b><small>Пароль не сохраняется на сервере</small></li>
+        <li><span class="fi" aria-hidden="true">⏱</span><b>Автоудаление</b><small id="ttlFeature">Файлы удаляются автоматически</small></li>
+      </ul>
+    </section>
+
+    <!-- Рабочая область -->
+    <section class="workspace" id="workspace" hidden>
+      <div class="ws-main">
+        <div class="ws-head">
+          <h2 id="wsTitle">Файлы</h2>
+          <button class="btn btn-ghost" id="addMoreBtn" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            Добавить ещё
+          </button>
+        </div>
+
+        <div class="banner" id="doneBanner" hidden>
+          <div class="banner-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="banner-text">
+            <b id="doneTitle">Готово!</b>
+            <span id="doneSub">Документы Word готовы к скачиванию.</span>
+          </div>
+          <div class="banner-actions">
+            <a class="btn btn-primary" id="downloadAllBtn" href="#">Скачать</a>
+            <button class="btn btn-ghost" id="restartBtn" type="button">Конвертировать ещё</button>
+          </div>
+        </div>
+
+        <div class="grid" id="fileGrid" aria-live="polite"></div>
+      </div>
+
+      <aside class="ws-side" id="sidePanel">
+        <h3>Параметры</h3>
+        <div class="opt">
+          <div class="opt-row">
+            <label class="switch">
+              <input type="checkbox" id="ocrToggle" checked>
+              <span class="slider" aria-hidden="true"></span>
+              <span class="switch-label">Распознавать сканы (OCR)</span>
+            </label>
+          </div>
+          <p class="opt-help" id="ocrHelp">Отсканированные страницы станут редактируемым текстом. Без OCR они будут вставлены в Word картинками.</p>
+          <label class="field" id="langField">
+            <span>Язык документа</span>
+            <select id="ocrLang"></select>
+          </label>
+        </div>
+        <div class="opt opt-note">
+          <p>Диапазон страниц и пароль можно задать на карточке файла.</p>
+        </div>
+        <button class="btn btn-xl btn-primary btn-block" id="convertBtn" type="button" disabled>
+          Конвертировать в Word
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m0 0-5-5m5 5-5 5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <p class="side-foot" id="sideFoot"></p>
+      </aside>
+    </section>
+  </main>
+
+  <div class="drag-overlay" id="dragOverlay" hidden>
+    <div class="drag-box">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <b>Отпустите PDF файлы</b>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <input type="file" id="fileInput" accept="application/pdf,.pdf" multiple hidden>
+
+  <template id="cardTpl">
+    <article class="card">
+      <button class="card-remove" type="button" aria-label="Убрать файл" title="Убрать файл">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+      </button>
+      <div class="thumb">
+        <img alt="" hidden>
+        <div class="thumb-ph" aria-hidden="true"><span>PDF</span></div>
+        <div class="badges"></div>
+        <div class="overlay" hidden>
+          <div class="ring"><svg viewBox="0 0 44 44"><circle class="ring-bg" cx="22" cy="22" r="19"/><circle class="ring-fg" cx="22" cy="22" r="19"/></svg><span class="ring-pct">0%</span></div>
+          <div class="overlay-stage"></div>
+        </div>
+        <div class="done-mark" hidden aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-name" title=""></div>
+        <div class="card-meta"></div>
+        <form class="pw" hidden>
+          <input type="password" placeholder="Пароль к PDF" autocomplete="off" aria-label="Пароль к PDF">
+          <button class="btn btn-small" type="submit">Открыть</button>
+        </form>
+        <div class="pages-row" hidden>
+          <label>Страницы:
+            <input class="pages-input" type="text" placeholder="все" inputmode="numeric" aria-label="Диапазон страниц, например 1-3, 5">
+          </label>
+        </div>
+        <div class="card-error" hidden></div>
+        <div class="card-info" hidden></div>
+        <div class="card-actions"></div>
+      </div>
+      <div class="upload-bar" hidden><i></i></div>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

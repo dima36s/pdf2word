@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8
+httpx>=0.27
+reportlab>=4.0      # генерация тестовых PDF
+matplotlib>=3.8     # график в тестовом отчёте
+playwright>=1.44    # tests/ui_e2e.py

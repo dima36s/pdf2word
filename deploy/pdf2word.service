@@ -1,0 +1,34 @@
+# systemd-юнит для установки без Docker.
+# Установка: см. docs/DEPLOY-CORP.md, вариант В.
+#   sudo cp deploy/pdf2word.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pdf2word
+
+[Unit]
+Description=PDF to Word converter
+After=network.target
+
+[Service]
+Type=simple
+User=pdf2word
+Group=pdf2word
+WorkingDirectory=/opt/pdf2word
+Environment=DATA_DIR=/var/lib/pdf2word
+Environment=CONVERT_WORKERS=2
+Environment=CONVERT_TIMEOUT=900
+Environment=FILE_TTL_MIN=60
+Environment=MAX_FILE_MB=100
+Environment=WORKER_MEMORY_MB=3072
+ExecStart=/opt/pdf2word/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+Restart=on-failure
+RestartSec=5
+
+# Ограничения безопасности
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pdf2word
+StateDirectory=pdf2word
+
+[Install]
+WantedBy=multi-user.target
