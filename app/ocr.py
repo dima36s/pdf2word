@@ -84,6 +84,9 @@ def resolve_lang(lang: str | None) -> str:
 
 @lru_cache(maxsize=1)
 def ocr_font_file() -> str:
+    env = os.environ.get("OCR_FONT")
+    if env and Path(env).is_file():
+        return env
     for path in _SERIF_FONTS:
         if Path(path).is_file():
             return path
@@ -100,6 +103,9 @@ def ocr_font_file() -> str:
 
 @lru_cache(maxsize=1)
 def ocr_bold_font_file() -> str | None:
+    env = os.environ.get("OCR_FONT_BOLD")
+    if env and Path(env).is_file():
+        return env
     reg = Path(ocr_font_file())
     for cand in (reg.name.replace("Regular", "Bold"), reg.stem + "-Bold" + reg.suffix,
                  reg.name.replace(".ttf", "bd.ttf")):
@@ -304,8 +310,14 @@ def _bbox(t: dict) -> tuple[float, float, float, float]:
     return b[0], b[1], b[2], b[3]
 
 
-def parse_hocr(data: bytes) -> OcrResult:
-    root = ET.fromstring(data)
+def parse_hocr(data: bytes | str) -> OcrResult:
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        # Tesseract.js отдаёт фрагмент (один или несколько <div class='ocr_page'>) без XHTML-обёртки
+        root = ET.fromstring(b"<root>" + re.sub(rb"<\?xml[^>]*>|<!DOCTYPE[^>]*>", b"", data) + b"</root>")
     paragraphs: list[Paragraph] = []
     photos = []
     for el in root.iter():
@@ -360,6 +372,8 @@ def _clean_word(w: Word) -> Word | None:
     text = w.text.strip(_JUNK_EDGE) if len(w.text) > 1 else w.text
     if not text:
         return None
+    if text in ("—", "–", "‒", "-") and w.conf < 80:
+        return None  # «тире» в широком пробеле выравнивания по ширине — артефакт распознавания
     core = re.sub(r"[\W_]+", "", text)
     if not core:
         if text in ("|", "_", "‘", "`", "'", "¦", "~", "^", "°") or w.conf < 60 or len(text) > 3:
@@ -588,13 +602,22 @@ def render_page(page: pymupdf.Page, dpi: int) -> tuple[Image.Image, float]:
     return img, pix.width / w_in
 
 
-def ocr_replace_page(doc: pymupdf.Document, index: int, lang: str, dpi: int | None = None) -> int:
-    """Заменяет страницу index документа doc на распознанную. Возвращает число слов."""
+@dataclass
+class PreparedScan:
+    """Страница-скан, подготовленная к распознаванию."""
+    img: Image.Image          # цветная, повёрнутая и выровненная
+    clean: Image.Image        # серая, без линий таблиц — её распознаёт Tesseract
+    dpi: float
+    h_rules: list[Rect]
+    v_rules: list[Rect]
+
+
+def prepare_scan(page: pymupdf.Page, dpi: int | None = None, detect_orientation: bool = True) -> PreparedScan:
     from PIL import ImageFilter
 
-    img, real_dpi = render_page(doc[index], dpi or settings.ocr_dpi)
+    img, real_dpi = render_page(page, dpi or settings.ocr_dpi)
     gray = img.convert("L").filter(ImageFilter.MedianFilter(3))  # убирает «соль и перец» скана
-    rotation = detect_rotation(gray)
+    rotation = detect_rotation(gray) if detect_orientation and tesseract_available() else 0
     if rotation:
         img = img.rotate(-rotation, expand=True)
         gray = gray.rotate(-rotation, expand=True)
@@ -604,10 +627,25 @@ def ocr_replace_page(doc: pymupdf.Document, index: int, lang: str, dpi: int | No
         gray = gray.rotate(skew, resample=Image.BICUBIC, fillcolor=255)
     h_rules, v_rules = detect_table_rules(gray, real_dpi)
     clean = erase_rules(gray, h_rules + v_rules)
-    hocr = _run_tesseract(_png(clean), ["-l", lang, "--dpi", str(int(real_dpi)), "--psm", "3", "hocr"])
+    return PreparedScan(img, clean, real_dpi, h_rules, v_rules)
+
+
+def scan_png(prep: PreparedScan) -> bytes:
+    return _png(prep.clean)
+
+
+def apply_hocr(doc: pymupdf.Document, index: int, prep: PreparedScan, hocr: bytes | str) -> int:
+    """Заменяет страницу index на собранную из hOCR. Возвращает число слов."""
     res = parse_hocr(hocr)
     tmp = pymupdf.open()
-    n = build_text_page(tmp, res, img, real_dpi, h_rules, v_rules, InkAnalyzer(clean, img))
+    n = build_text_page(tmp, res, prep.img, prep.dpi, prep.h_rules, prep.v_rules, InkAnalyzer(prep.clean, prep.img))
     doc.insert_pdf(tmp, start_at=index)
     doc.delete_page(index + 1)
     return n
+
+
+def ocr_replace_page(doc: pymupdf.Document, index: int, lang: str, dpi: int | None = None) -> int:
+    """Распознаёт страницу локальным Tesseract и заменяет её. Возвращает число слов."""
+    prep = prepare_scan(doc[index], dpi)
+    hocr = _run_tesseract(scan_png(prep), ["-l", lang, "--dpi", str(int(prep.dpi)), "--psm", "3", "hocr"])
+    return apply_hocr(doc, index, prep, hocr)

@@ -99,77 +99,129 @@ def _noop(_p: float, _s: str) -> None:
     pass
 
 
-def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn = _noop) -> ConvertStats:
-    t0 = time.monotonic()
-    install_patches()
-    from pdf2docx import Converter  # импорт здесь: тяжёлый, нужен только в рабочем процессе
-    from pdf2docx.page.Pages import Pages
+class Conversion:
+    """Конвертация по шагам. На сервере всё делает convert_pdf(); в браузерной версии шаги
+    вызываются из JavaScript, потому что распознавание сканов там выполняет Tesseract.js:
 
-    stats = ConvertStats()
-    progress(1, "Открываю документ")
-    doc = open_pdf(src, opts.password)
-    try:
-        stats.pages_total = doc.page_count
-        indices = parse_page_range(opts.pages, doc.page_count)
-        targets = indices if indices is not None else list(range(doc.page_count))
-        stats.pages_converted = len(targets)
+        conv = Conversion(src, opts, external_ocr=True)
+        for i in conv.ocr_todo:
+            png = conv.prepare_ocr(i)          # картинка страницы → JS → hOCR
+            conv.apply_ocr(i, hocr)
+        stats = conv.finish(dst)
+    """
 
-        # ---------------------------------------------------------------- сканы и OCR
-        progress(3, "Анализирую страницы")
-        kinds = {i: classify_page(doc[i]) for i in targets}
-        scans = [i for i in targets if kinds[i] in ("scan", "ocred")]
-        work = doc
+    def __init__(self, src: Path, opts: ConvertOptions, progress: ProgressFn = _noop,
+                 external_ocr: bool = False):
+        install_patches()
+        self.t0 = time.monotonic()
+        self.src, self.opts, self.progress = Path(src), opts, progress
+        self.stats = ConvertStats()
+        self._prepared: dict[int, ocr.PreparedScan] = {}
+        progress(1, "Открываю документ")
+        self.doc = open_pdf(src, opts.password)
+        self.work = self.doc
+        try:
+            self.stats.pages_total = self.doc.page_count
+            self.indices = parse_page_range(opts.pages, self.doc.page_count)
+            self.targets = self.indices if self.indices is not None else list(range(self.doc.page_count))
+            self.stats.pages_converted = len(self.targets)
+            progress(3, "Анализирую страницы")
+            self.kinds = {i: classify_page(self.doc[i]) for i in self.targets}
+        except BaseException:
+            self.close()
+            raise
+        scans = [i for i in self.targets if self.kinds[i] in ("scan", "ocred")]
+        self.ocr_todo: list[int] = []
         if scans and opts.ocr != "off":
-            if not ocr.tesseract_available():
-                stats.warnings.append("Распознавание текста (OCR) на этом сервере отключено — "
-                                      "отсканированные страницы вставлены как изображения.")
+            if external_ocr or ocr.tesseract_available():
+                self.ocr_todo = scans
             else:
-                lang = ocr.resolve_lang(opts.ocr_lang)
-                work = editable_copy(doc)
-                for k, i in enumerate(scans):
-                    progress(5 + 40 * k / len(scans), f"Распознаю текст: страница {i + 1} из {doc.page_count}")
-                    try:
-                        ocr.ocr_replace_page(work, i, lang)
-                        stats.ocr_pages += 1
-                    except ocr.OcrError as exc:
-                        log.warning("OCR failed on page %s: %s", i + 1, exc)
-                        stats.warnings.append(f"Страница {i + 1}: не удалось распознать текст, вставлена картинкой.")
+                self.stats.warnings.append("Распознавание текста (OCR) на этом сервере отключено — "
+                                           "отсканированные страницы вставлены как изображения.")
         elif scans:
-            stats.warnings.append(f"Найдено отсканированных страниц: {len(scans)}. "
-                                  "Они вставлены как изображения (распознавание выключено).")
+            self.stats.warnings.append(f"Найдено отсканированных страниц: {len(scans)}. "
+                                       "Они вставлены как изображения (распознавание выключено).")
 
-        # ---------------------------------------------------------------- фоновые плашки
+    # ------------------------------------------------------------------ OCR
+    def _ensure_work(self):
+        if self.work is self.doc:
+            self.work = editable_copy(self.doc)
+        return self.work
+
+    def run_ocr(self) -> None:
+        """Распознавание всех сканов локальным Tesseract (серверная версия)."""
+        if not self.ocr_todo:
+            return
+        lang = ocr.resolve_lang(self.opts.ocr_lang)
+        work = self._ensure_work()
+        for k, i in enumerate(self.ocr_todo):
+            self.progress(5 + 40 * k / len(self.ocr_todo),
+                          f"Распознаю текст: страница {i + 1} из {self.doc.page_count}")
+            try:
+                ocr.ocr_replace_page(work, i, lang)
+                self.stats.ocr_pages += 1
+            except ocr.OcrError as exc:
+                log.warning("OCR failed on page %s: %s", i + 1, exc)
+                self.ocr_failed(i)
+
+    def prepare_ocr(self, i: int) -> bytes:
+        """Браузер: подготовить страницу (наклон, линии таблиц) и вернуть PNG для Tesseract.js."""
+        prep = ocr.prepare_scan(self.doc[i], detect_orientation=False)
+        self._prepared[i] = prep
+        return ocr.scan_png(prep)
+
+    def apply_ocr(self, i: int, hocr: bytes | str) -> None:
+        """Браузер: собрать страницу из hOCR, полученного от Tesseract.js."""
+        prep = self._prepared.pop(i)
+        try:
+            ocr.apply_hocr(self._ensure_work(), i, prep, hocr)
+            self.stats.ocr_pages += 1
+        except Exception as exc:
+            log.warning("OCR apply failed on page %s: %s", i + 1, exc)
+            self.ocr_failed(i)
+
+    def ocr_failed(self, i: int) -> None:
+        self._prepared.pop(i, None)
+        self.stats.warnings.append(f"Страница {i + 1}: не удалось распознать текст, вставлена картинкой.")
+
+    # ------------------------------------------------------------------ основной разбор
+    def finish(self, dst: Path) -> ConvertStats:
+        from pdf2docx import Converter  # импорт здесь: тяжёлый
+        from pdf2docx.page.Pages import Pages
+
+        stats, progress, doc, opts = self.stats, self.progress, self.doc, self.opts
+
+        # фоновые плашки
         panels = {}
-        for i in targets:
-            if kinds[i] == "text":
+        for i in self.targets:
+            if self.kinds[i] == "text":
                 try:
                     if found := find_background_panels(doc[i]):
                         panels[i] = found
                 except Exception:
                     log.warning("panel detection failed on page %s", i + 1)
         if panels:
-            if work is doc:
-                work = editable_copy(doc)
+            work = self._ensure_work()
             for i, rects in panels.items():
                 try:
                     remove_background_panels(work[i], rects)
                 except Exception:
                     log.warning("panel removal failed on page %s", i + 1)
 
-        # ---------------------------------------------------------------- pdf2docx
-        base = 45 if stats.ocr_pages else 5
+        # pdf2docx
+        base = 45 if self.ocr_todo else 5
         progress(base, "Анализирую структуру документа")
         cv = Converter.__new__(Converter)       # используем уже открытый (и расшифрованный) документ
-        cv.filename_pdf = str(src)
+        cv.filename_pdf = str(self.src)
         cv.password = ""
-        cv._fitz_doc = work
+        cv._fitz_doc = self.work
         cv._pages = Pages()
         cfg = {**cv.default_settings, **PARSE_SETTINGS}
 
         collector = _PageErrorCollector()
         logging.getLogger().addHandler(collector)
         try:
-            cv.load_pages(pages=indices)
+            cv.load_pages(pages=self.indices)
             cv.parse_document(**cfg)
 
             to_parse = [p for p in cv.pages if not p.skip_parsing]
@@ -208,6 +260,7 @@ def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn
             _merge_column_sections(docx)
         except Exception:
             log.exception("column section merge failed")
+        dst = Path(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=dst.parent)
         os.close(fd)
@@ -218,14 +271,25 @@ def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn
             os.replace(tmp, dst)
         finally:
             tmp.unlink(missing_ok=True)
-    finally:
-        if work is not doc:
-            work.close()
-        doc.close()
 
-    stats.seconds = round(time.monotonic() - t0, 2)
-    progress(100, "Готово")
-    return stats
+        stats.seconds = round(time.monotonic() - self.t0, 2)
+        progress(100, "Готово")
+        return stats
+
+    def close(self) -> None:
+        if self.work is not self.doc:
+            self.work.close()
+        self.doc.close()
+
+
+def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn = _noop) -> ConvertStats:
+    """Полная конвертация (серверная версия)."""
+    conv = Conversion(src, opts, progress)
+    try:
+        conv.run_ocr()
+        return conv.finish(dst)
+    finally:
+        conv.close()
 
 
 def _finalize_docx(docx, title: str | None) -> None:

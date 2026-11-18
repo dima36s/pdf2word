@@ -1,0 +1,47 @@
+name: GitHub Pages
+
+# Браузерная версия: собирается из web/ и app/ и публикуется в ветку gh-pages
+# → https://<owner>.github.io/<repo>/
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Сборка и публикация
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Шрифты
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-liberation
+      - name: Кэш Pyodide и Tesseract.js
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pdf2word-web
+          key: web-pyodide-0.28.3-tesseract-7.0.0-v1
+      - name: Сборка сайта
+        run: python scripts/build_web.py --out _site --cache ~/.cache/pdf2word-web
+      - name: Публикация в gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          publish_branch: gh-pages
+          force_orphan: true
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: "Сайт: ${{ github.sha }}"
