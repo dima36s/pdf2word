@@ -95,6 +95,14 @@ def test_symbol_bullet_mapped():
     assert _text_of(out[0]["lines"][0]) == "•"
 
 
+def test_cell_text_with_nested_table():
+    # вложенная таблица отдаёт text списком — проверка ложных таблиц не должна падать
+    from types import SimpleNamespace
+    from app.textfix import _cell_text
+    cell = SimpleNamespace(blocks=[SimpleNamespace(text="Поз."), SimpleNamespace(text=[["1", "Насос"], ["2", None]])])
+    assert _cell_text(cell) == "Поз. 1 Насос 2"
+
+
 def test_line_end_space_between_wrapped_lines():
     block = {"type": 0, "lines": [_line("трансформация", 0, y=100), _line("производственных", 0, y=114)]}
     out = normalize_text_blocks([block])
@@ -177,6 +185,56 @@ def test_browser_panels(tmp_path):
     assert "Ноутбук" in text and "736 000,00" in text and "Покупатель" in text
     assert st.tables <= 3  # плашки не должны распадаться на десяток таблиц 1×1
     assert "2026 г.Срок" not in text  # пробел между строками разных блоков (кириллица)
+
+
+def _part(docx: Path, prefix: str) -> str:
+    z = zipfile.ZipFile(docx)
+    return "\n".join(z.read(n).decode() for n in z.namelist() if n.startswith(prefix))
+
+
+def test_report_headers_footers(tmp_path):
+    # повторяющиеся шапка и низ страницы → настоящие колонтитулы Word
+    out = tmp_path / "rh.docx"
+    st = convert_pdf(_need("report.pdf"), out, ConvertOptions())
+    assert st.headers >= 2
+    assert "Внутренний отчёт" in _part(out, "word/header") and "Конфиденциально" in _part(out, "word/footer")
+    assert "Внутренний отчёт" not in _text(out)
+
+
+def test_gost_spec_sheet(tmp_path):
+    """Спецификация с рамкой из САПР: таблица — таблицей, а не картинкой; штампы — в колонтитулах."""
+    out = tmp_path / "spec.docx"
+    st = convert_pdf(_need("gost_spec.pdf"), out, ConvertOptions())
+    assert st.images <= 1                          # раньше весь лист становился одной картинкой
+    assert st.tables >= 1
+    body = _text(out)
+    assert "Метран-150" in body and "Расходомер электромагнитный DN50" in body
+    assert "Разраб." not in body and "Инв. № подл." not in body
+    footer, header = _part(out, "word/footer"), _part(out, "word/header")
+    assert "Спецификация оборудования" in footer and "Листов" in footer
+    assert "Инв. № подл." in header and "w:txbxContent" in header and "v:rect" in header
+    assert 'w:textDirection w:val="btLr"' in header or 'w:textDirection w:val="tbRl"' in header
+    d = Document(out)
+    assert len(d.sections) >= 2 and all(s.page_width > s.page_height for s in d.sections)
+
+
+def test_gost_text_sheets(tmp_path):
+    """Текстовая часть: шапка с логотипом и линией, штамп с номером листа, содержание, заголовки."""
+    out = tmp_path / "text.docx"
+    st = convert_pdf(_need("gost_text.pdf"), out, ConvertOptions())
+    header, footer = _part(out, "word/header"), _part(out, "word/footer")
+    assert "Е110-0162-УКК.25.1087-РД-01-03.03.086-АТХ.ОЛ" in header and "w:pBdr" in header  # линия под шапкой
+    assert "Трубопровод технического конденсата" in footer and 'w:instr=" PAGE "' in footer
+    body = _text(out)
+    assert "ИНЖИНИРИНГ" not in body and "Трубопровод технического" not in body
+    xml = zipfile.ZipFile(out).read("word/document.xml").decode()
+    assert xml.count('w:leader="dot"') >= 3         # строки содержания — табуляция с отточием
+    assert 'w:start="2"' in xml                    # нумерация листов начинается со 2
+    d = Document(out)
+    styles = {p.style.name for p in d.paragraphs}
+    assert "Heading 1" in styles
+    assert d.sections[-1].page_width > d.sections[-1].page_height   # лист A3 альбомный
+    assert st.headers >= 2
 
 
 @pytest.mark.skipif(not tesseract_available(), reason="tesseract не установлен")

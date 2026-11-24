@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import ocr
+from .regionfix import regions
 from .pdftools import (ConversionError, classify_page, editable_copy, find_background_panels, open_pdf,
                        parse_page_range, remove_background_panels)
 from .textfix import install_patches, parse_page_safely
@@ -56,6 +57,9 @@ PARSE_SETTINGS = {
     "ignore_page_error": True,
     "multi_processing": False,
     "debug": False,
+    # Word рисует линию таблицы кусками по ячейкам, на стыках — зазоры до 0,7 pt. С допуском
+    # по умолчанию (0,5) границы «не сходятся» и весь лист спецификации становился одной ячейкой.
+    "connected_border_tolerance": 1.5,
 }
 
 
@@ -75,6 +79,7 @@ class ConvertStats:
     ocr_pages: int = 0
     tables: int = 0
     images: int = 0
+    headers: int = 0                # колонтитулов из шапки/штампа листа
     seconds: float = 0.0
     warnings: list[str] = field(default_factory=list)
 
@@ -130,7 +135,11 @@ class Conversion:
         except BaseException:
             self.close()
             raise
-        scans = [i for i in self.targets if self.kinds[i] in ("scan", "ocred")]
+        scans = [i for i in self.targets if self.kinds[i] in ("scan", "ocred", "vector")]
+        vector = [i for i in scans if self.kinds[i] == "vector"]
+        if vector:
+            pages = ", ".join(str(i + 1) for i in vector[:10]) + ("…" if len(vector) > 10 else "")
+            self.stats.warnings.append(f"Текст нарисован линиями (шрифт САПР), страницы распознаны как сканы: {pages}.")
         self.ocr_todo: list[int] = []
         if scans and opts.ocr != "off":
             if external_ocr or ocr.tesseract_available():
@@ -190,6 +199,7 @@ class Conversion:
         from pdf2docx.page.Pages import Pages
 
         stats, progress, doc, opts = self.stats, self.progress, self.doc, self.opts
+        warnings_before = list(stats.warnings)
 
         # фоновые плашки
         panels = {}
@@ -220,19 +230,23 @@ class Conversion:
 
         collector = _PageErrorCollector()
         logging.getLogger().addHandler(collector)
+        made: list[int] = []
+        plan = None
         try:
+            plan = self._plan_furniture(cfg, base)
             cv.load_pages(pages=self.indices)
-            cv.parse_document(**cfg)
+            with regions(self.work, plan.body_specs if plan else {}):
+                cv.parse_document(**cfg)
 
-            to_parse = [p for p in cv.pages if not p.skip_parsing]
-            span = (90 - base) * 0.75
-            for k, page in enumerate(to_parse):
-                progress(base + span * k / max(len(to_parse), 1), f"Разбираю страницу {page.id + 1}")
-                try:
-                    parse_page_safely(page, cfg)
-                except Exception as exc:  # одна страница не должна валить весь документ
-                    log.warning("page %s parse error: %s", page.id + 1, exc)
-                    collector.pages.append(page.id + 1)
+                to_parse = [p for p in cv.pages if not p.skip_parsing]
+                span = (90 - base) * 0.75
+                for k, page in enumerate(to_parse):
+                    progress(base + span * k / max(len(to_parse), 1), f"Разбираю страницу {page.id + 1}")
+                    try:
+                        parse_page_safely(page, cfg)
+                    except Exception as exc:  # одна страница не должна валить весь документ
+                        log.warning("page %s parse error: %s", page.id + 1, exc)
+                        collector.pages.append(page.id + 1)
 
             from docx import Document
             docx = Document()
@@ -244,6 +258,7 @@ class Conversion:
                 progress(start + (95 - start) * k / len(ready), f"Собираю Word: страница {page.id + 1}")
                 try:
                     page.make_docx(docx)
+                    made.append(page.id)
                 except Exception as exc:
                     log.warning("page %s make_docx error: %s", page.id + 1, exc)
                     collector.pages.append(page.id + 1)
@@ -260,6 +275,27 @@ class Conversion:
             _merge_column_sections(docx)
         except Exception:
             log.exception("column section merge failed")
+        try:
+            from .docxfix import improve_structure
+            improve_structure(docx)   # заголовки → стили Word, содержание с отточием
+        except Exception:
+            log.exception("structure post-processing failed")
+        if plan:
+            try:
+                stats.headers = self._attach_furniture(docx, plan, made)
+            except Exception:
+                # шапка и штамп уже убраны из текста страниц — без колонтитулов они бы пропали,
+                # поэтому документ собирается заново по-старому
+                log.exception("header/footer attach failed, converting again without them")
+                self._furniture_off = True
+                stats.warnings[:] = warnings_before
+                stats.headers = 0
+                return self.finish(dst)
+        try:
+            from .docxfix import fit_pages
+            fit_pages(docx)       # лист PDF — одна страница Word (после колонтитулов: они занимают место)
+        except Exception:
+            log.exception("page fitting failed")
         dst = Path(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(suffix=".docx", dir=dst.parent)
@@ -276,10 +312,151 @@ class Conversion:
         progress(100, "Готово")
         return stats
 
+    # ------------------------------------------------------------------ колонтитулы
+    def _plan_furniture(self, cfg: dict, base: float) -> "_FurniturePlan | None":
+        """Шапка, штампы и рамка листа → отдельные проходы pdf2docx для колонтитулов (app/furniture.py)."""
+        from . import furniture as fu
+        from . import geometry as geo
+        from . import headers
+        from .regionfix import Spec
+
+        if getattr(self, "_furniture_off", False):
+            return None
+        eligible = [i for i in self.targets if self.kinds[i] == "text" and not self.work[i].rotation]
+        if not eligible:
+            return None
+        try:
+            elems = [fu.elements_from_fitz(self.work[i]) for i in eligible]
+            found = fu.detect(elems)
+        except Exception:
+            log.warning("page furniture detection failed", exc_info=True)
+            return None
+        plan = _FurniturePlan()
+        for i, pe, f in zip(eligible, elems, found):
+            if not f.empty or f.frame is not None:
+                plan.pages[i] = (pe, f)
+        if not plan.pages:
+            return None
+        self.progress(base, "Переношу шапку и штамп в колонтитулы")
+
+        def inside(e, boxes):
+            return any(geo.contains(b, e.bbox, 1.5) for b in boxes)
+
+        for i, (pe, f) in plan.pages.items():
+            # общие поля тела и колонтитулов: по всему содержимому, кроме бокового штампа (он
+            # «плавающий») — тогда ни у текста, ни у шапки не будет отрицательных отступов
+            content = [e for e in pe.elems if not inside(e, list(f.sides) + list(f.drop))]
+            if content:
+                x0, x1 = min(e.bbox[0] for e in content), max(e.bbox[2] for e in content)
+                plan.lr[i] = (min(72.0, round(max(x0, 0.0), 1)), min(72.0, round(max(pe.width - x1 - 1.0, 0.0), 1)))
+            else:
+                plan.lr[i] = None
+
+        def boxes_of(f, kind):
+            if kind == "header":
+                return [f.header] if f.header else []
+            if kind == "footer":
+                return [f.footer] if f.footer else []
+            return list(f.sides)
+
+        for kind in ("header", "footer", "side"):
+            specs, alias, seen = {}, {}, {}
+            for i, (pe, f) in plan.pages.items():
+                boxes = boxes_of(f, kind)
+                if not boxes:
+                    continue
+                inner = sorted((e.kind, e.text, tuple(round(v) for v in e.bbox)) for e in pe.elems if inside(e, boxes))
+                sig = (round(pe.width), round(pe.height), tuple(boxes), tuple(inner), plan.lr[i])
+                if sig in seen:          # одинаковая шапка на многих листах — разбираем один раз
+                    alias[i] = seen[sig]
+                    continue
+                seen[sig] = i
+                # боковой штамп стоит левее рамки и вставляется «плавающим» — общие поля ему не нужны
+                # (с ними pdf2docx отбросил бы его как содержимое за полем страницы)
+                specs[i] = Spec(keep=boxes, frame=f.frame, lr_margin=None if kind == "side" else plan.lr[i],
+                                frame_mode="touched" if kind == "footer" else "drop")
+            try:
+                res = headers.band_pass(self.work, cfg, specs)
+            except Exception:
+                log.warning("%s pass failed", kind, exc_info=True)
+                res = {}
+            for i, j in alias.items():
+                if j in res:
+                    res[i] = res[j]
+            plan.bands[kind] = res
+
+        for i, (pe, f) in plan.pages.items():
+            ok_h = bool(f.header) and i in plan.bands["header"]
+            ok_f = bool(f.footer) and i in plan.bands["footer"]
+            ok_s = bool(f.sides) and i in plan.bands["side"]
+            exclude = ([f.header] if ok_h else []) + ([f.body_footer or f.footer] + list(f.drop) if ok_f else []) \
+                + (list(f.sides) if ok_s else [])
+            plan.body_specs[i] = Spec(exclude=exclude, frame=f.frame,
+                                      top_limit=f.header[3] if ok_h else None,
+                                      bottom_limit=f.footer[1] if ok_f else None,
+                                      lr_margin=plan.lr[i])
+            dist = {}
+            if ok_h:
+                tops = [e.bbox[1] for e in pe.elems if inside(e, [f.header])]
+                dist["header"] = (min(tops) if tops else f.header[1]) - 0.5
+            elif f.frame is not None or ok_s:
+                dist["header"] = 0.0
+            if ok_f:
+                bottoms = [e.bbox[3] for e in pe.elems if inside(e, [f.footer])]
+                dist["footer"] = pe.height - (max(bottoms) if bottoms else f.footer[3]) - 0.5
+            plan.distances[i] = dist
+        return plan
+
+    def _attach_furniture(self, docx, plan: "_FurniturePlan", made: list[int]) -> int:
+        from docx.enum.section import WD_SECTION
+
+        from . import headers
+
+        page_secs = [s for s in docx.sections if s.start_type == WD_SECTION.NEW_PAGE]
+        if len(page_secs) != len(made):
+            raise RuntimeError(f"sections/pages mismatch ({len(page_secs)}/{len(made)})")
+        contents: dict[int, dict] = {}
+        for pid in made:
+            if pid not in plan.pages:
+                continue
+            _, f = plan.pages[pid]
+            c = {}
+            if (r := plan.bands["header"].get(pid)) is not None:
+                c["header"] = headers.prepare(r[0])
+            side = plan.bands["side"].get(pid)
+            if side is not None or f.frame is not None:
+                band = c.get("header") or headers.Band([])
+                if side is not None:
+                    sb = headers.prepare(side[0])
+                    tables = [el for el in sb.elements if el.tag == headers.w("tbl")]
+                    for el, bbox in zip(tables, side[1]):
+                        band.elements.append(headers.textbox_paragraph([el], bbox))
+                    band.images.update(sb.images)
+                if f.frame is not None:
+                    band.elements.append(headers.frame_paragraph(f.frame))
+                c["header"] = band
+            if (r := plan.bands["footer"].get(pid)) is not None:
+                c["footer"] = headers.prepare(r[0])
+            contents[pid] = c
+        first = headers.page_fields(contents)
+        n = headers.attach(list(zip(made, page_secs)), contents, plan.distances)
+        if first is not None and first != 1 and made and made[0] in contents:
+            headers.set_start_page(page_secs[0], first)
+        return n
+
     def close(self) -> None:
         if self.work is not self.doc:
             self.work.close()
         self.doc.close()
+
+
+@dataclass
+class _FurniturePlan:
+    pages: dict = field(default_factory=dict)        # номер страницы → (PageElems, Furniture)
+    lr: dict = field(default_factory=dict)           # одинаковые поля слева/справа
+    bands: dict = field(default_factory=lambda: {"header": {}, "footer": {}, "side": {}})
+    body_specs: dict = field(default_factory=dict)
+    distances: dict = field(default_factory=dict)
 
 
 def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn = _noop) -> ConvertStats:

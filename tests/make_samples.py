@@ -306,6 +306,9 @@ def make_encrypted(src: Path) -> Path:
 
 
 if __name__ == "__main__":
+    from gost_samples import make_gost_spec, make_gost_text
+    print("ok", make_gost_text())
+    print("ok", make_gost_spec())
     rep = make_report()
     print("ok", rep)
     print("ok", make_two_columns())

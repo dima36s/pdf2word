@@ -12,6 +12,7 @@ pymupdf.TOOLS.mupdf_display_warnings(False)
 
 MIN_TEXT_CHARS = 25        # меньше видимых символов — страница считается «без текста»
 SCAN_IMAGE_COVERAGE = 0.5  # картинка закрывает не меньше половины страницы — похоже на скан
+VECTOR_TEXT_PATHS = 400    # столько мелких путей без текстового слоя — текст нарисован линиями (САПР)
 
 
 class ConversionError(Exception):
@@ -73,9 +74,28 @@ def _image_coverage(page: pymupdf.Page) -> float:
     return min(covered / area, 1.0)
 
 
+def _vector_text(page: pymupdf.Page) -> bool:
+    """Текст нарисован линиями (шрифты SHX из AutoCAD/nanoCAD и т.п.): текстового слоя нет, зато
+    тысячи мелких путей. pdf2docx вставил бы такой лист картинкой — его нужно распознавать."""
+    try:
+        drawings = page.get_cdrawings()
+    except Exception:
+        return False
+    if len(drawings) < VECTOR_TEXT_PATHS:
+        return False
+    page_area = abs(page.rect) or 1.0
+    small = 0
+    for d in drawings:
+        x0, y0, x1, y1 = d.get("rect", (0, 0, 0, 0))
+        if (x1 - x0) * (y1 - y0) < page_area * 2e-4 and max(x1 - x0, y1 - y0) < 40:
+            small += 1
+    return small >= VECTOR_TEXT_PATHS
+
+
 def classify_page(page: pymupdf.Page) -> str:
     """'text' — обычная страница с текстом; 'scan' — картинка без текста;
-    'ocred' — скан с невидимым распознанным слоем (такой слой pdf2docx игнорирует)."""
+    'ocred' — скан с невидимым распознанным слоем (такой слой pdf2docx игнорирует);
+    'vector' — текст нарисован линиями (выгрузка из САПР), распознаётся как скан."""
     visible = hidden = 0
     try:
         spans = page.get_texttrace()
@@ -91,6 +111,8 @@ def classify_page(page: pymupdf.Page) -> str:
         return "text"
     if _image_coverage(page) >= SCAN_IMAGE_COVERAGE:
         return "ocred" if hidden >= MIN_TEXT_CHARS else "scan"
+    if _vector_text(page):
+        return "vector"
     return "text"
 
 

@@ -217,6 +217,7 @@
       const parts = [`${s.pages_converted} ${plural(s.pages_converted, ["стр.", "стр.", "стр."])} → DOCX ${fmtSize(t.output_size)}`];
       if (s.tables) parts.push(`таблиц: ${s.tables}`);
       if (s.ocr_pages) parts.push(`OCR: ${s.ocr_pages} стр.`);
+      if (s.headers) parts.push("шапка и штамп — в колонтитулах");
       meta.textContent = parts.join(" · ");
     } else {
       meta.textContent = [t.pages ? `${t.pages} стр.` : null, fmtSize(item.size)].filter(Boolean).join(" · ");

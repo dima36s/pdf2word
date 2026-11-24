@@ -38,7 +38,8 @@ TESSERACT_JS = "7.0.0"
 TESSERACT_CORES = ["tesseract-core-relaxedsimd-lstm.wasm.js", "tesseract-core-simd-lstm.wasm.js",
                    "tesseract-core-lstm.wasm.js"]
 OCR_LANGS = ["rus", "eng"]
-APP_MODULES = ["__init__.py", "config.py", "converter.py", "ocr.py", "pdftools.py", "textfix.py", "webapi.py"]
+APP_MODULES = ["__init__.py", "config.py", "converter.py", "docxfix.py", "furniture.py", "geometry.py", "headers.py", "ocr.py",
+               "pdftools.py", "regionfix.py", "textfix.py", "vectorfix.py", "webapi.py"]
 FONT_DIRS = ["/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/liberation2",
              "/usr/share/fonts/liberation-serif", "/usr/share/fonts/liberation"]
 FONTS = ["LiberationSerif-Regular.ttf", "LiberationSerif-Bold.ttf"]

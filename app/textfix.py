@@ -30,7 +30,7 @@ _WINGDINGS_PUA = {
     0xF0F0: "⇨", 0xF0E0: "➢", 0xF077: "⬥", 0xF0B2: "✧",
 }
 
-_LIST_MARKERS = set("•◦▪▫■□●○‣⁃–—-*·➢✓❖◆➔⇨❑►▸")
+_LIST_MARKERS = set("•◦▪▫■□●○‣⁃–—−-*·➢✓❖◆➔⇨❑►▸")   # «−» — минус из шрифта Symbol (списки Word)
 _LIST_MARKER_RE = re.compile(r"^(\(?\d{1,3}[.)]|\d{1,2}\.\d{1,2}\.?|[a-zа-яё][.)]|[IVXLC]{1,5}\.)$", re.I)
 
 
@@ -227,6 +227,11 @@ def install_patches() -> None:
     def _preprocess_text(self, **settings):
         blocks = original(self, **settings)
         try:
+            from .regionfix import filter_text
+            blocks = filter_text(self.page_engine, blocks)  # проходы «тело/колонтитул» (app/furniture.py)
+        except Exception:
+            log.exception("region filter failed")
+        try:
             return normalize_text_blocks(blocks)
         except Exception:  # нормализация не должна ломать конвертацию
             log.exception("text normalization failed")
@@ -234,6 +239,24 @@ def install_patches() -> None:
 
     RawPageFitz._preprocess_text = _preprocess_text
     _patch_paragraph_split()
+    try:
+        _patch_char_scaling()
+    except Exception:
+        log.exception("char scaling patch failed")
+    try:
+        _patch_two_line_indent()
+    except Exception:
+        log.exception("two-line indent patch failed")
+    try:
+        from . import vectorfix
+        vectorfix.install()
+    except Exception:  # без патча графики конвертация всё равно работает
+        log.exception("vector graphics patch failed")
+    try:
+        from . import regionfix
+        regionfix.install()
+    except Exception:
+        log.exception("region filter patch failed")
     _installed = True
 
 
@@ -338,8 +361,18 @@ def _page_tables(page):
             yield from _iter_tables(column.blocks)
 
 
+def _flat_text(value) -> str:
+    """Текст блока: у вложенной таблицы pdf2docx отдаёт список строк, а не строку."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return " ".join(_flat_text(v) for v in value if v is not None)
+    return ""
+
+
 def _cell_text(cell) -> str:
-    return " ".join(b.text for b in (cell.blocks or []) if hasattr(b, "text")).strip()
+    # раньше вложенная таблица в ячейке роняла разбор всей страницы (TypeError в join)
+    return " ".join(_flat_text(getattr(b, "text", "")) for b in (cell.blocks or [])).strip()
 
 
 def _suspicious_stream_table(table) -> bool:
@@ -389,3 +422,145 @@ def parse_page_safely(page, settings: dict) -> bool:
     page.__dict__.update(backup)
     page.parse(**{**settings, "parse_stream_table": False})
     return True
+
+
+# --------------------------------------------------------------------------- сжатие символов
+
+# Шрифты, ширины которых совпадают со встроенными шрифтами MuPDF (Helvetica = Arial,
+# Times = Times New Roman, Courier = Courier New; у MuPDF в них есть и кириллица).
+_METRIC_FAMILIES = (
+    (("arial", "helvetica", "liberationsans", "liberation sans", "arimo"), ("helv", "hebo", "heit", "hebi")),
+    (("timesnewroman", "times new roman", "times", "liberationserif", "liberation serif", "tinos"),
+     ("tiro", "tibo", "tiit", "tibi")),
+    (("couriernew", "courier new", "courier", "liberationmono", "liberation mono", "cousine"),
+     ("cour", "cobo", "coit", "cobi")),
+)
+_REF_FONTS: dict = {}
+MIN_SCALE_CHARS = 4
+
+
+def _reference_font(name: str, bold: bool, italic: bool):
+    """Встроенный шрифт MuPDF с теми же ширинами, что у шрифта PDF, или None."""
+    low = re.sub(r"^[A-Z]{6}\+", "", name or "").lower().replace("-", "").replace(",", "")
+    if "narrow" in low or "condensed" in low:
+        return None
+    for keys, variants in _METRIC_FAMILIES:
+        if any(k in low for k in keys):
+            bold = bold or "bold" in low
+            italic = italic or "italic" in low or "oblique" in low
+            code = variants[(1 if bold else 0) + (2 if italic else 0)]
+            if code not in _REF_FONTS:
+                import pymupdf
+                _REF_FONTS[code] = pymupdf.Font(code)
+            return _REF_FONTS[code]
+    return None
+
+
+def horizontal_scale(chars, ref_font, font_size: float) -> float | None:
+    """Во сколько раз буквы в PDF уже (меньше 1) или шире естественной ширины шрифта.
+
+    Word при выгрузке в PDF записывает «масштаб» символов как горизонтальное сжатие глифов; pdf2docx
+    его теряет, и в Word текст выходит шире, чем в PDF: коды в узких графах таблиц переносятся,
+    строки растут, лист уходит на следующую страницу. Сравниваются ширины букв без пробелов, поэтому
+    растянутые выравниванием по ширине пробелы на результат не влияют.
+    """
+    glyphs = [c for c in chars if c.c.strip()]
+    if len(glyphs) < MIN_SCALE_CHARS:
+        return None
+    # только горизонтальный текст
+    if glyphs[-1].bbox[0] <= glyphs[0].bbox[0]:
+        return None
+    observed = sum(c.bbox[2] - c.bbox[0] for c in glyphs)
+    natural = ref_font.text_length("".join(c.c for c in glyphs), fontsize=font_size)
+    if natural <= 0 or observed <= 0:
+        return None
+    return observed / natural
+
+
+def _set_run_scale(run, percent: int) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    rpr = run._r.get_or_add_rPr()
+    for old in rpr.findall(qn("w:w")):
+        rpr.remove(old)
+    if percent == 100:
+        return
+    el = OxmlElement("w:w")
+    el.set(qn("w:val"), str(percent))
+    rpr.insert_element_before(el, "w:kern", "w:position", "w:sz", "w:szCs", "w:highlight", "w:u",
+                              "w:effect", "w:bdr", "w:shd", "w:fitText", "w:vertAlign", "w:rtl", "w:cs",
+                              "w:em", "w:lang", "w:eastAsianLayout", "w:specVanish", "w:oMath")
+
+
+def _patch_char_scaling() -> None:
+    from pdf2docx.text.TextSpan import TextSpan
+
+    original = TextSpan._set_text_format
+
+    def _set_text_format(self, docx_run):
+        original(self, docx_run)
+        try:
+            font_size = round(self.size * 2) / 2.0 or self.size
+            percent = None
+            ref = _reference_font(self.font, bool(self.flags & 2 ** 4), bool(self.flags & 2 ** 1))
+            if ref is not None and self.chars:
+                scale = horizontal_scale(self.chars, ref, font_size)
+                if scale is not None and abs(scale - 1.0) >= 0.03:
+                    percent = int(round(min(max(scale, 0.5), 2.0) * 100))
+            if percent is None:
+                # поправка pdf2docx на округление кегля — целым числом (дробное Word/LibreOffice не читают)
+                scale = self.size / font_size
+                percent = int(round(scale * 100)) if abs(scale - 1.0) >= 0.01 else 100
+            _set_run_scale(docx_run, percent)
+        except Exception:
+            log.debug("char scaling skipped", exc_info=True)
+
+    TextSpan._set_text_format = _set_text_format
+
+
+# --------------------------------------------------------------------------- красная строка в двух строках
+
+def two_line_indent(x0_first: float, x0_second: float, x1_first: float, x1_block: float,
+                    right_threshold: float) -> tuple[float, bool] | None:
+    """(отступ первой строки, первая строка во всю ширину) для абзаца из двух строк или None.
+
+    pdf2docx ищет отступ первой строки только у абзацев от трёх строк: у двухстрочного абзаца
+    с красной строкой левые края расходятся, и он считает абзац «невыровненным» — отступ
+    теряется (жалоба на опросные листы: «не сохраняется форматирование, отступ»)."""
+    indent = x0_first - x0_second
+    if not (2.0 <= abs(indent) <= 100.0):
+        return None
+    return indent, x1_first >= x1_block - max(right_threshold, 1.0)
+
+
+def _patch_two_line_indent() -> None:
+    from pdf2docx.common.share import TextAlignment
+    from pdf2docx.text.TextBlock import TextBlock
+
+    original = TextBlock._parse_alignment
+
+    def _parse_alignment(self, bbox, text_direction_param, line_separate_threshold,
+                         lines_left_aligned_threshold, lines_right_aligned_threshold,
+                         lines_center_aligned_threshold):
+        res = original(self, bbox, text_direction_param, line_separate_threshold, lines_left_aligned_threshold,
+                       lines_right_aligned_threshold, lines_center_aligned_threshold)
+        try:
+            idx0, idx1, f = text_direction_param
+            if res != TextAlignment.NONE or f != 1:
+                return res
+            rows = self.lines.group_by_physical_rows()
+            if len(rows) != 2 or any(len(r) != 1 for r in rows):
+                return res
+            found = two_line_indent(rows[0][0].bbox[idx0], rows[1][0].bbox[idx0], rows[0][-1].bbox[idx1],
+                                    self.bbox[idx1], lines_right_aligned_threshold)
+            if found is None:
+                return res
+            indent, full = found
+            self.first_line_space = indent
+            return TextAlignment.JUSTIFY if full else TextAlignment.LEFT
+        except Exception:
+            log.debug("two-line indent skipped", exc_info=True)
+            return res
+
+    TextBlock._parse_alignment = _parse_alignment
