@@ -786,6 +786,141 @@ def _spacer(p) -> bool:
     return sp is not None and sp.get(w("lineRule")) == "exact" and _twip_attr(sp, "line") >= 4.0
 
 
+def _sect_layout(sect) -> tuple[str, int]:
+    """(тип начала раздела, число колонок) по w:sectPr."""
+    if sect is None:
+        return "nextPage", 1
+    t = sect.find(w("type"))
+    cols = sect.find(w("cols"))
+    try:
+        num = int(cols.get(w("num"), "1")) if cols is not None else 1
+    except ValueError:
+        num = 1
+    return (t.get(w("val"), "nextPage") if t is not None else "nextPage"), max(1, num)
+
+
+def _column_chunks(elems: list) -> list[list]:
+    """Элементы раздела по колонкам: абзац с разрывом колонки начинает следующую."""
+    chunks: list[list] = [[]]
+    for el in elems:
+        if el.tag == w("p") and any(br.get(w("type")) == "column" for br in el.iter(w("br"))):
+            chunks.append([])
+        chunks[-1].append(el)
+    return [c for c in chunks if c]
+
+
+def _el_height(el, width: float | None) -> tuple[float, int]:
+    """(высота, число строк таблицы) элемента тела."""
+    if el.tag == w("p"):
+        return paragraph_height(el, width), 0
+    if el.tag == w("tbl"):
+        if el.find(f"{w('tblPr')}/{w('tblpPr')}") is not None:
+            return 0.0, 0      # плавающая таблица места в потоке не занимает
+        rows = el.findall(w("tr"))
+        return sum(max(*_row_height(tr)) for tr in rows), len(rows)
+    return 0.0, 0
+
+
+def _chunk_height(elems, width) -> tuple[float, int]:
+    total, rows = 0.0, 0
+    for el in elems:
+        h, r = _el_height(el, width)
+        total += h
+        rows += r
+    return total, rows
+
+
+class _PagePart:
+    """Раздел Word в пределах листа PDF: одна колонка или несколько (высота — по самой высокой)."""
+
+    def __init__(self, elems: list, cols: int, width: float):
+        self.elems, self.cols = elems, cols
+        self.width = width / cols if cols > 1 else width
+        self.chunks = _column_chunks(elems) if cols > 1 else [elems]
+
+    def height(self) -> tuple[float, int]:
+        sizes = [_chunk_height(c, self.width) for c in self.chunks]
+        return max(sizes, key=lambda hr: hr[0]) if sizes else (0.0, 0)
+
+
+def _page_groups(docx) -> list[tuple[object, list[_PagePart]]]:
+    """Листы PDF: раздел «с новой страницы» и следующие за ним непрерывные разделы
+    (pdf2docx делит лист на разделы по колонкам)."""
+    body = docx.element.body
+    groups = _section_groups(body)
+    pages: list[tuple[object, list[_PagePart]]] = []
+    for section, elems in zip(docx.sections, groups):
+        kind, cols = _sect_layout(section._sectPr)
+        try:
+            width = (section.page_width - section.left_margin - section.right_margin) / 12700.0
+        except Exception:
+            width = None
+        part = _PagePart(elems, cols, width or 0.0)
+        if kind == "continuous" and pages:
+            pages[-1][1].append(part)
+        else:
+            pages.append((section, [part]))
+    return pages
+
+
+def _reclaim(elems: list, amount: float) -> float:
+    """Забирает до amount pt у отступов между блоками; возвращает, сколько забрано."""
+    excess = amount
+    # 1) пустые абзацы-отступы между блоками
+    for p in sorted((el for el in elems if _spacer(el)), key=paragraph_height, reverse=True):
+        if excess <= 0:
+            break
+        sp = p.find(f"{w('pPr')}/{w('spacing')}")
+        line = _twip_attr(sp, "line")
+        take = min(excess, line * 0.8)
+        sp.set(w("line"), str(max(20, int(round((line - take) * 20)))))
+        excess -= take
+    # 2) большие интервалы «после» у абзацев: ими pdf2docx воспроизводит промежуток до следующего блока
+    for p in sorted((el for el in elems if el.tag == w("p")),
+                    key=lambda el: _twip_attr(el.find(f"{w('pPr')}/{w('spacing')}"), "after"), reverse=True):
+        if excess <= 0:
+            break
+        sp = p.find(f"{w('pPr')}/{w('spacing')}")
+        after = _twip_attr(sp, "after")
+        if after < 6.0:
+            break
+        take = min(excess, after * 0.8)
+        sp.set(w("after"), str(int(round((after - take) * 20))))
+        excess -= take
+    # 3) большие интервалы «перед» абзацами: титульные листы, разрядка блоков
+    for p in sorted((el for el in elems if el.tag == w("p")),
+                    key=lambda el: _twip_attr(el.find(f"{w('pPr')}/{w('spacing')}"), "before"), reverse=True):
+        if excess <= 0:
+            break
+        sp = p.find(f"{w('pPr')}/{w('spacing')}")
+        before = _twip_attr(sp, "before")
+        if before < 12.0:
+            break
+        take = min(excess, before * 0.5)
+        sp.set(w("before"), str(int(round((before - take) * 20))))
+        excess -= take
+    return amount - excess
+
+
+def _shrink_last_rows(tbl, amount: float) -> float:
+    """4) нижние строки таблицы (у строки остаётся её содержимое)."""
+    excess = amount
+    for tr in reversed(tbl.findall(w("tr"))):
+        if excess <= 0:
+            break
+        h = tr.find(f"{w('trPr')}/{w('trHeight')}")
+        if h is None or h.get(w("hRule")) == "exact":
+            continue
+        min_h, content = _row_height(tr)
+        room = min_h - max(content, min_h * 0.6)
+        if room <= 0.5:
+            continue
+        take = min(excess, room)
+        h.set(w("val"), str(int(round((min_h - take) * 20))))
+        excess -= take
+    return amount - excess
+
+
 def fit_pages(docx) -> int:
     """Лист PDF не должен растягиваться на две страницы Word.
 
@@ -793,14 +928,16 @@ def fit_pages(docx) -> int:
     штампа, оказывается в Word «впритык»: толщина линий таблиц и округления выталкивают хвост на
     новую страницу (пустую или с обрывком таблицы). Если оценка высоты листа не оставляет запаса,
     недостающие пункты забираются у пустых абзацев-отступов между блоками, затем у нижней строки
-    последней таблицы. Возвращает число подогнанных листов.
+    последней таблицы. Лист — это раздел «с новой страницы» вместе с непрерывными разделами за ним;
+    у раздела в несколько колонок высота — по самой высокой колонке.
+    Возвращает число подогнанных листов.
     """
     body = docx.element.body
     for tbl in body.iter(w("tbl")):
         _thin_filler_rows(tbl)
     fitted = 0
     header_h = footer_h = 0.0
-    for section, group in zip(docx.sections, _section_groups(body)):
+    for section, parts in _page_groups(docx):
         # колонтитулы выше полей раздвигают поля — Word считает от их реальной высоты
         try:
             width = (section.page_width - section.left_margin - section.right_margin) / 12700.0
@@ -813,70 +950,31 @@ def fit_pages(docx) -> int:
             avail = section.page_height / 12700.0 - top - bottom
         except Exception:
             continue
-        rows = 0
-        budget = 0.0
-        for el in group:
-            if el.tag == w("p"):
-                budget += paragraph_height(el, width)
-            elif el.tag == w("tbl"):
-                for tr in el.findall(w("tr")):
-                    min_h, content = _row_height(tr)
-                    budget += max(min_h, content)
-                    rows += 1
+        sizes = [part.height() for part in parts]
+        budget = sum(h for h, _ in sizes)
+        rows = sum(r for _, r in sizes)
         excess = budget - (avail - FIT_SAFETY - FIT_SAFETY_PER_ROW * rows)
         if excess <= 0:
             continue
         fitted += 1
-        # 1) пустые абзацы-отступы между блоками (не первый: он ставит таблицу к верху рамки)
-        spacers = [el for el in group[1:] if _spacer(el)]
-        for p in sorted(spacers, key=paragraph_height, reverse=True):
-            if excess <= 0:
-                break
-            sp = p.find(f"{w('pPr')}/{w('spacing')}")
-            line = _twip_attr(sp, "line")
-            take = min(excess, line * 0.8)
-            sp.set(w("line"), str(max(20, int(round((line - take) * 20)))))
-            excess -= take
-        # 2) большие интервалы «после» у абзацев: ими pdf2docx воспроизводит промежуток до следующего блока
-        for p in sorted((el for el in group[1:] if el.tag == w("p")),
-                        key=lambda el: _twip_attr(el.find(f"{w('pPr')}/{w('spacing')}"), "after"), reverse=True):
-            if excess <= 0:
-                break
-            sp = p.find(f"{w('pPr')}/{w('spacing')}")
-            after = _twip_attr(sp, "after")
-            if after < 6.0:
-                break
-            take = min(excess, after * 0.8)
-            sp.set(w("after"), str(int(round((after - take) * 20))))
-            excess -= take
-        # 3) большие интервалы «перед» абзацами (кроме первого): титульные листы, разрядка блоков
-        for p in sorted((el for el in group[1:] if el.tag == w("p")),
-                        key=lambda el: _twip_attr(el.find(f"{w('pPr')}/{w('spacing')}"), "before"), reverse=True):
-            if excess <= 0:
-                break
-            sp = p.find(f"{w('pPr')}/{w('spacing')}")
-            before = _twip_attr(sp, "before")
-            if before < 12.0:
-                break
-            take = min(excess, before * 0.5)
-            sp.set(w("before"), str(int(round((before - take) * 20))))
-            excess -= take
-        # 4) нижняя строка последней таблицы листа (у строки остаётся её содержимое)
-        tables = [el for el in group if el.tag == w("tbl")]
+        # первый элемент листа не трогаем: он ставит таблицу к верху рамки
+        first = parts[0].elems[0] if parts[0].elems else None
+        single = [el for part in parts if part.cols == 1 for el in part.elems if el is not first]
+        excess -= _reclaim(single, excess)
+        for part in parts:
+            if excess <= 0 or part.cols == 1:
+                continue
+            # колонки: ужимаем те, что выше целевой высоты раздела
+            sec_h = part.height()[0]
+            target = sec_h - excess
+            for chunk in part.chunks:
+                h = _chunk_height(chunk, part.width)[0]
+                if h > target:
+                    _reclaim([el for el in chunk if el is not first], h - target)
+            excess -= sec_h - part.height()[0]
+        tables = [el for part in parts if part.cols == 1 for el in part.elems if el.tag == w("tbl")]
         if excess > 0 and tables:
-            for tr in reversed(tables[-1].findall(w("tr"))):
-                if excess <= 0:
-                    break
-                h = tr.find(f"{w('trPr')}/{w('trHeight')}")
-                if h is None or h.get(w("hRule")) == "exact":
-                    continue
-                min_h, content = _row_height(tr)
-                room = min_h - max(content, min_h * 0.6)
-                if room <= 0.5:
-                    continue
-                take = min(excess, room)
-                h.set(w("val"), str(int(round((min_h - take) * 20))))
-                excess -= take
+            excess -= _shrink_last_rows(tables[-1], excess)
     return fitted
 
 

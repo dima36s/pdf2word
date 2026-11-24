@@ -87,3 +87,71 @@ def test_plan_chart_stays_image():
              geo.PathGeom((110, 120, 390, 290), False)]
     plan = geo.plan_region(region, paths)
     assert plan.images == [region] and plan.shapes == []
+
+
+def test_shading_rows_get_hidden_borders():
+    # «полосатая» таблица из Word: вертикали на всю высоту, горизонтали только вокруг групп строк
+    v = [(100, 50, 300), (200, 50, 300), (300, 50, 300)]
+    h = [(50, 100, 300), (300, 100, 300), (150, 200, 300)]
+    fills = [(200, 70, 300, 90), (200, 110, 300, 130), (200, 150.2, 300, 170)]
+    rows = geo.shading_row_borders(fills, h, v)
+    assert [round(y) for y, _, _ in rows] == [70, 90, 110, 130, 170]      # 150 — уже линия
+    assert all((x0, x1) == (200, 300) for _, x0, x1 in rows)
+
+
+def test_shading_without_grid_is_not_a_row():
+    # заливка-плашка вне таблицы и заливка без правой вертикали — не трогаем
+    v = [(100, 50, 300)]
+    assert geo.shading_row_borders([(100, 70, 300, 90)], [], v) == []
+    assert geo.shading_row_borders([(400, 70, 500, 90)], [], v) == []
+    # тонкая заливка — это линия
+    assert geo.shading_row_borders([(100, 70, 300, 71)], [], [(100, 0, 400), (300, 0, 400)]) == []
+
+
+def test_white_margins_trimmed_from_picture():
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from app.imagetrim import trim_white_margins
+
+    img = Image.new("RGB", (200, 100), "white")
+    ImageDraw.Draw(img).rectangle((20, 10, 139, 89), fill=(30, 30, 30))   # чертёж, справа белое поле
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    raw = {"type": 1, "bbox": (100.0, 200.0, 300.0, 300.0), "width": 200, "height": 100, "image": buf.getvalue()}
+    out = trim_white_margins(raw)
+    x0, y0, x1, y1 = out["bbox"]
+    assert x0 == pytest.approx(119, abs=1.5) and x1 == pytest.approx(240, abs=1.5)
+    assert y0 == pytest.approx(209, abs=1.5) and y1 == pytest.approx(290, abs=1.5)
+    assert Image.open(io.BytesIO(out["image"])).size == (out["width"], out["height"])
+    # без заметных полей — без изменений
+    full = Image.new("RGB", (100, 100), (200, 0, 0))
+    buf = io.BytesIO()
+    full.save(buf, format="PNG")
+    raw = {"bbox": (0.0, 0.0, 50.0, 50.0), "width": 100, "height": 100, "image": buf.getvalue()}
+    assert trim_white_margins(raw) is raw
+
+
+def test_group_row_without_verticals_is_bridged():
+    # таблица «Крепеж»: части сетки, между ними строка «Ду215  40  16» без вертикалей
+    xs = [58, 146, 319, 383, 468, 546]
+    parts = [(60, 110), (126, 176)]          # просвет 110…126 — строка подзаголовка
+    v = [(x, a, b) for a, b in parts for x in xs]
+    h = [(y, 58, 546) for a, b in parts for y in (a, b)] + [(85, 58, 546), (151, 58, 546)]
+    bridges = geo.band_bridges(h, v)
+    assert sorted(round(x) for x, _, _ in bridges) == xs
+    assert all((round(y0), round(y1)) == (110, 126) for _, y0, y1 in bridges)
+
+
+def test_separate_tables_are_not_bridged():
+    xs = [58, 146, 319]
+    # просвет больше строки (подпись «Таблица 2» с отступами) — две разные таблицы
+    v = [(x, 60, 110) for x in xs] + [(x, 160, 200) for x in xs]
+    h = [(y, 58, 319) for y in (60, 110, 160, 200)]
+    assert geo.band_bridges(h, v) == []
+    # две вертикали — мало для строки таблицы; нет горизонтали снизу — не закрытая строка
+    v = [(x, 60, 110) for x in xs[:2]] + [(x, 126, 176) for x in xs[:2]]
+    assert geo.band_bridges([(y, 58, 146) for y in (60, 110, 126, 176)], v) == []
+    v = [(x, 60, 110) for x in xs] + [(x, 126, 176) for x in xs]
+    assert geo.band_bridges([(y, 58, 319) for y in (60, 110, 176)], v) == []

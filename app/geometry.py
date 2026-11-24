@@ -197,3 +197,102 @@ def plan_region(region: Box, paths: Sequence[PathGeom]) -> RegionPlan:
     # прямые пути, целиком лежащие внутри картинки, не дублируем линиями
     keep = [i for i in straight if not any(contains(c, paths[i].bbox, 0.5) for c in clusters)]
     return RegionPlan(shapes=keep, images=clusters)
+
+
+# --------------------------------------------------------------------------- строки по заливке
+
+SHADING_EDGE_TOL = 1.5     # pt: край заливки и линия сетки совпадают с этой точностью
+SHADING_COVER = 0.75       # такая доля стороны заливки должна быть покрыта линией
+SHADING_MIN = 3.0          # pt: заливка тоньше — это линия, а не ячейка
+
+HLine = tuple[float, float, float]   # (y, x0, x1)
+VLine = tuple[float, float, float]   # (x, y0, y1)
+
+
+def _covered(pos: float, lo: float, hi: float, lines: Sequence[tuple[float, float, float]],
+             tol: float) -> float:
+    """Доля отрезка [lo, hi] на уровне pos, покрытая линиями (pos, a, b)."""
+    spans = sorted((max(a, lo), min(b, hi)) for p, a, b in lines if abs(p - pos) <= tol and b > lo and a < hi)
+    total, reach = 0.0, lo
+    for a, b in spans:
+        if b <= reach:
+            continue
+        total += b - max(a, reach)
+        reach = b
+    return total / max(hi - lo, 1e-6)
+
+
+def shading_row_borders(fills: Sequence[Box], h_lines: Sequence[HLine], v_lines: Sequence[VLine],
+                        tol: float = SHADING_EDGE_TOL) -> list[HLine]:
+    """Невидимые границы строк таблицы по краям заливки ячеек.
+
+    Word рисует «полосатые» таблицы без линий между строками: строки различаются только серой
+    заливкой через одну. pdf2docx строит сетку таблицы только по линиям, поэтому такие строки
+    сливались в одну огромную ячейку, а текст из неё рассыпался абзацами под таблицей.
+
+    Заливка считается ячейкой, если слева и справа от неё идут вертикальные линии сетки; верх и низ
+    такой заливки без горизонтальной линии становятся границами строк (без отрисовки).
+    """
+    out: list[HLine] = []
+    seen: set[tuple[float, float, float]] = set()
+    for x0, y0, x1, y1 in fills:
+        if x1 - x0 < SHADING_MIN or y1 - y0 < SHADING_MIN:
+            continue
+        if (_covered(x0, y0, y1, v_lines, tol) < SHADING_COVER
+                or _covered(x1, y0, y1, v_lines, tol) < SHADING_COVER):
+            continue
+        for y in (y0, y1):
+            if _covered(y, x0, x1, h_lines, tol) >= SHADING_COVER:
+                continue
+            key = (round(y, 1), round(x0, 1), round(x1, 1))
+            if key not in seen:
+                seen.add(key)
+                out.append((y, x0, x1))
+    return out
+
+
+# --------------------------------------------------------------------------- строка без вертикалей
+
+BAND_MAX_GAP = 20.0        # pt: строка-подзаголовок группы («Ду215  40  16») — одна строка текста
+BAND_MIN_COLUMNS = 3       # столько вертикалей должно прерваться на одной и той же строке
+
+
+def band_bridges(h_lines: Sequence[HLine], v_lines: Sequence[VLine],
+                 max_gap: float = BAND_MAX_GAP, tol: float = 1.0) -> list[VLine]:
+    """Невидимые вертикали через строку таблицы, нарисованную без вертикальных линий.
+
+    В каталогах Word строка-подзаголовок группы («Ду215», «Ду265»…) идёт на всю ширину без
+    перегородок. pdf2docx видел вместо одной таблицы десяток: части сетки между подзаголовками,
+    а подзаголовки — абзацами между ними. Если на одной высоте прерываются сразу несколько
+    вертикалей, а сверху и снизу просвет закрыт горизонталями на всю ширину, — это строка той же
+    таблицы: вертикали продолжаются через неё (невидимыми).
+    """
+    by_band: dict[tuple[int, int], list[VLine]] = {}
+    by_x: dict[int, list[VLine]] = {}
+    for ln in v_lines:
+        by_x.setdefault(round(ln[0]), []).append(ln)
+    for x, y0, y1 in v_lines:
+        near = [b for k in (round(x) - 1, round(x), round(x) + 1) for b in by_x.get(k, ()) if abs(b[0] - x) <= tol]
+        nxt = [b for b in near if y1 + 2 < b[1] <= y1 + max_gap]
+        if not nxt:
+            continue
+        start = min(b[1] for b in nxt)
+        if any(b[1] < start - 0.5 and b[2] > y1 + 0.5 for b in near):
+            continue          # просвет уже перекрыт другой вертикалью
+        by_band.setdefault((round(y1), round(start)), []).append((x, y1, start))
+    out: list[VLine] = []
+    for (_, _), bridges in by_band.items():
+        xs = sorted({round(x, 1) for x, _, _ in bridges})
+        if len(xs) < BAND_MIN_COLUMNS:
+            continue
+        top = min(b[1] for b in bridges)
+        bottom = max(b[2] for b in bridges)
+        lo, hi = xs[0], xs[-1]
+        if (_covered(top, lo, hi, h_lines, 1.5) < 0.9 or _covered(bottom, lo, hi, h_lines, 1.5) < 0.9):
+            continue
+        seen = set()
+        for x, y0, y1 in sorted(bridges):
+            if round(x, 1) not in seen:
+                seen.add(round(x, 1))
+                out.append((x, y0, y1))
+    return out

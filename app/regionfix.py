@@ -315,10 +315,11 @@ def install() -> None:
     def _preprocess_images(self, **settings):
         images = original_images(self, **settings)
         try:
-            return filter_images(self.page_engine, images)
+            images = filter_images(self.page_engine, images)
         except Exception:
             log.debug("image filter failed", exc_info=True)
-            return images
+        from .imagetrim import trim_images
+        return trim_images(images)       # белые поля картинок (app/imagetrim.py)
 
     def calculate_margin(self, **settings):
         margin = original_margin(self, **settings)

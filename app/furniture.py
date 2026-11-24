@@ -142,6 +142,9 @@ def _is_frame_elem(e: Elem, frame: Box | None) -> bool:
 
 # --------------------------------------------------------------------------- рамка
 
+FRAME_EDGE = 0.1     # рамка ГОСТ идёт по полям листа: не дальше 10 % высоты от верха и низа
+
+
 def find_frame(page: PageElems) -> Box | None:
     W, H = page.width, page.height
     best = None
@@ -168,6 +171,8 @@ def find_frame(page: PageElems) -> Box | None:
     x0, y0, x1, y1 = best
     if x0 < 2 or y0 < 2 or W - x1 < 2 or H - y1 < 2:
         return None   # рамка по краю листа — это не ГОСТ-рамка, а обводка страницы
+    if y0 > FRAME_EDGE * H or H - y1 > FRAME_EDGE * H:
+        return None   # начинается под заголовком — это контур большой таблицы, а не рамка листа
     return tuple(round(v, 2) for v in best)
 
 
@@ -309,6 +314,12 @@ def find_footer_box(page: PageElems, frame: Box | None, sides: list[Box]) -> Box
     # вертикаль начинается выше верхней линии — таблица продолжается вверх, это не штамп
     if any(box[0] - 1 <= v[0] <= box[2] + 1 and v[1] < y - 5 and v[3] > y - 2 for v in vs):
         return None
+    # те же колонки, что у таблицы выше (между ними строка без линий, «Ду830»), — тоже таблица
+    own = {round(v[0], 1) for v in vs if box[0] - 1 <= v[0] <= box[2] + 1 and v[1] >= y - 3 and v[3] <= box[3] + 3}
+    above = [v[0] for v in vs if y - 0.25 * H <= v[3] <= y + 2 and v[1] < y - 5]
+    same = sum(1 for x in own if any(abs(x - a) <= 1.0 for a in above))
+    if len(own) >= 3 and same >= max(3, 0.6 * len(own)):
+        return None
     for e in page.elems:
         if _is_frame_elem(e, frame) or _inside_any(e.bbox, sides):
             continue
@@ -343,33 +354,40 @@ def _same_place(a: Elem, b: Elem, pa: PageElems, pb: PageElems, top: bool, tol: 
             or abs((a.bbox[0] + a.bbox[2]) / pa.width - (b.bbox[0] + b.bbox[2]) / pb.width) * pa.width <= 2 * tol)
 
 
+def _elem_key(e: Elem) -> tuple:
+    return tuple(e.bbox), e.kind, e.text, e.vertical, tuple(tuple(s) for s in e.segs)
+
+
 def repeated_bands(pages: list[PageElems], zone: float = 0.13) -> list[tuple[float | None, float | None]]:
     """Для каждого листа: (низ повторяющейся шапки, верх повторяющегося низа) или None."""
     n = len(pages)
     out: list[tuple[float | None, float | None]] = [(None, None)] * n
     if n < 2:
         return out
+
+    def in_zone(e: Elem, pg: PageElems, top: bool) -> bool:
+        return e.bbox[3] <= zone * pg.height if top else e.bbox[1] >= (1 - zone) * pg.height
+
+    # элементы у верхнего и нижнего края каждого листа — один раз на документ
+    zones = {top: [[e for e in pg.elems if in_zone(e, pg, top)] for pg in pages] for top in (True, False)}
     for i, p in enumerate(pages):
         # сравниваем с соседними листами (до 6 с каждой стороны): быстро и на длинных документах
         window = [j for j in range(max(0, i - 6), min(n, i + 7)) if j != i]
         need = max(2, (len(window) + 2) // 2)
         res = []
         for top in (True, False):
-            def in_zone(e: Elem, pg: PageElems, top: bool = top) -> bool:
-                return e.bbox[3] <= zone * pg.height if top else e.bbox[1] >= (1 - zone) * pg.height
             reps = []
-            zone_elems = [e for e in p.elems if in_zone(e, p)]
+            zone_elems = zones[top][i]
             if len(zone_elems) > 400:      # чертёж у края листа — повторы не ищем
                 res.append(None)
                 continue
             for e in zone_elems:
                 hits = 1 + sum(1 for j in window if any(
-                    in_zone(f, pages[j]) and _same_place(e, f, p, pages[j], top) for f in pages[j].elems))
+                    _same_place(e, f, p, pages[j], top) for f in zones[top][j]))
                 if hits >= need:
                     reps.append(e)
             # повтор, вплотную примыкающий к следующему тексту, — это начало тела (например,
             # одинаковая строка заголовков таблицы на каждом листе), а не шапка
-            others = [e for e in p.elems if e not in reps]
             while reps:
                 if top:
                     last = max(reps, key=lambda e: e.bbox[3])
@@ -381,17 +399,18 @@ def repeated_bands(pages: list[PageElems], zone: float = 0.13) -> list[tuple[flo
                 if gap >= MIN_BAND_GAP or last.kind == "path":
                     break
                 reps.remove(last)
-                others.append(last)
             if not any(e.kind == "text" for e in reps):
                 res.append(None)
                 continue
+            rep_keys = {_elem_key(e) for e in reps}    # как «e in reps»: равенство по полям
             if top:
                 edge = max(e.bbox[3] for e in reps) + 1.0
-                bad = any(e not in reps and e.bbox[1] < edge - 1.0 and e.bbox[3] > 0 for e in p.elems
-                          if e.bbox[3] > edge + 0.5)
+                bad = any(e.bbox[1] < edge - 1.0 and e.bbox[3] > 0 and _elem_key(e) not in rep_keys
+                          for e in p.elems if e.bbox[3] > edge + 0.5)
             else:
                 edge = min(e.bbox[1] for e in reps) - 1.0
-                bad = any(e not in reps and e.bbox[3] > edge + 1.0 for e in p.elems if e.bbox[1] < edge - 0.5)
+                bad = any(e.bbox[3] > edge + 1.0 and _elem_key(e) not in rep_keys
+                          for e in p.elems if e.bbox[1] < edge - 0.5)
             res.append(None if bad else edge)
         out[i] = (res[0], res[1])
     return out
@@ -424,6 +443,10 @@ def detect(pages: list[PageElems]) -> list[Furniture]:
                     f.drop.append(strip)
         else:
             f.footer = find_footer_box(p, f.frame, f.sides)
+            if f.footer is not None and rep_bottom is not None and f.footer[1] < rep_bottom - 20:
+                f.footer = None     # ниже есть повторяющийся низ листа — «рамка» была строками таблицы
+        # лист-«бланк»: рамка, штамп, боковой штамп или рамочный нижний блок
+        blank = f.frame is not None or bool(f.sides) or f.footer is not None
         if f.footer is None and rep_bottom is not None:
             f.footer = (0.0, rep_bottom, W, H)
         if f.footer is None and f.frame is not None:
@@ -433,7 +456,8 @@ def detect(pages: list[PageElems]) -> list[Furniture]:
                 f.footer = (0.0, f.frame[3] + 0.5, W, H)
         # шапка: повтор на соседних листах надёжнее; по линии — только на листе-«бланке»
         # (с рамкой, штампом или боковым штампом), иначе это может быть заголовок документа
-        if f.frame or f.footer or f.sides:
+        # или строка заголовков таблицы (каталог: повторяющийся низ листа — ещё не бланк)
+        if blank:
             f.header = find_header_by_rule(p, f.frame, f.sides)
         if f.header is None and rep_top is not None:
             f.header = (0.0, 0.0, W, rep_top)

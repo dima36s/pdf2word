@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import copy
+import io
 import logging
+import pickle
 import re
 
 log = logging.getLogger(__name__)
@@ -107,7 +109,57 @@ def _union(a, b):
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
-def _try_merge(a: dict, b: dict) -> bool:
+class Barriers:
+    """Вертикальные линии страницы (границы ячеек): фрагменты по разные стороны — разные ячейки."""
+
+    def __init__(self, lines=()):
+        self._lines = sorted(lines)               # (x, y0, y1)
+        self._xs = [ln[0] for ln in self._lines]
+
+    def __bool__(self) -> bool:
+        return bool(self._lines)
+
+    def between(self, x0: float, x1: float, y0: float, y1: float) -> bool:
+        """Есть ли линия с x в (x0, x1), перекрывающая по высоте половину строки [y0, y1]."""
+        from bisect import bisect_left, bisect_right
+        need = 0.5 * max(y1 - y0, 0.1)
+        for k in range(bisect_left(self._xs, x0), bisect_right(self._xs, x1)):
+            _, a, b = self._lines[k]
+            if min(b, y1) - max(a, y0) >= need:
+                return True
+        return False
+
+
+NO_BARRIERS = Barriers()
+BARRIER_THICKNESS = 3.0     # pt: Word рисует линии таблиц тонкими заливками
+
+
+def page_barriers(page) -> Barriers:
+    """Вертикальные линии и тонкие вертикальные заливки страницы PyMuPDF."""
+    try:
+        drawings = page.get_cdrawings()
+    except Exception:
+        return NO_BARRIERS
+    out = []
+    for d in drawings:
+        x0, y0, x1, y1 = d.get("rect", (0, 0, 0, 0))
+        if d.get("fill") is not None and d.get("color") is None:
+            if x1 - x0 <= BARRIER_THICKNESS and y1 - y0 > x1 - x0:
+                out.append(((x0 + x1) / 2, y0, y1))
+            continue
+        for it in d.get("items", ()):
+            if it[0] == "l":
+                (ax, ay), (bx, by) = tuple(it[1]), tuple(it[2])
+                if abs(ax - bx) <= 0.5 and abs(ay - by) > 1.0:
+                    out.append(((ax + bx) / 2, min(ay, by), max(ay, by)))
+            elif it[0] == "re":
+                rx0, ry0, rx1, ry1 = tuple(it[1])
+                if ry1 - ry0 > 1.0:
+                    out.extend(((rx0, ry0, ry1), (rx1, ry0, ry1)))
+    return Barriers(out)
+
+
+def _try_merge(a: dict, b: dict, barriers: Barriers = NO_BARRIERS) -> bool:
     """Склеить строку b в конец строки a, если это продолжение той же строки текста."""
     if not (_horizontal(a) and _horizontal(b)):
         return False
@@ -120,6 +172,9 @@ def _try_merge(a: dict, b: dict) -> bool:
     gap = b["bbox"][0] - a["bbox"][2]
     if gap < -0.5 or gap > 15 * size:
         return False
+    if barriers and barriers.between(a["bbox"][2] - 0.5, b["bbox"][0] + 0.5,
+                                     min(a["bbox"][1], b["bbox"][1]), max(a["bbox"][3], b["bbox"][3])):
+        return False      # между фрагментами линия таблицы: это соседние ячейки
     has_space = ca_last["c"].isspace() or cb_first["c"].isspace()
     if not has_space:
         if not (_is_list_marker(_line_text(a)) and gap < 4 * size):
@@ -185,7 +240,7 @@ def _add_line_end_space(line: dict, nxt: dict) -> None:
     line["spans"][-1]["chars"].append(_space_char(last, size * 0.25, size))
 
 
-def normalize_text_blocks(blocks: list[dict]) -> list[dict]:
+def normalize_text_blocks(blocks: list[dict], barriers: Barriers = NO_BARRIERS) -> list[dict]:
     for block in blocks:
         lines = block.get("lines")
         if not lines:
@@ -195,7 +250,7 @@ def normalize_text_blocks(blocks: list[dict]) -> list[dict]:
                 _fix_symbol_chars(span)
         merged = [lines[0]]
         for ln in lines[1:]:
-            if not _try_merge(merged[-1], ln):
+            if not _try_merge(merged[-1], ln, barriers):
                 merged.append(ln)
         for ln in merged:
             _absorb_blank_spans(ln)
@@ -232,7 +287,7 @@ def install_patches() -> None:
         except Exception:
             log.exception("region filter failed")
         try:
-            return normalize_text_blocks(blocks)
+            return normalize_text_blocks(blocks, page_barriers(self.page_engine))
         except Exception:  # нормализация не должна ломать конвертацию
             log.exception("text normalization failed")
             return blocks
@@ -257,6 +312,16 @@ def install_patches() -> None:
         regionfix.install()
     except Exception:
         log.exception("region filter patch failed")
+    try:
+        from . import imagetrim
+        imagetrim.install()
+    except Exception:
+        log.exception("image rotation patch failed")
+    try:
+        from . import speedups
+        speedups.install()
+    except Exception:  # без ускорения результат тот же, только медленнее
+        log.exception("speedup patch failed")
     _installed = True
 
 
@@ -404,22 +469,57 @@ def page_has_false_tables(page) -> bool:
     return bad > 0 and bad >= 0.5 * len(stream)
 
 
+class _PagePickler(pickle.Pickler):
+    """Снимок страницы: ссылки секций на саму страницу остаются ссылками на неё, а не на копию."""
+
+    def __init__(self, file, page):
+        super().__init__(file, protocol=pickle.HIGHEST_PROTOCOL)
+        self._page = page
+
+    def persistent_id(self, obj):
+        return "page" if obj is self._page else None
+
+
+class _PageUnpickler(pickle.Unpickler):
+    def __init__(self, file, page):
+        super().__init__(file)
+        self._page = page
+
+    def persistent_load(self, pid):
+        return self._page
+
+
+def _snapshot(page):
+    """Состояние страницы до разбора. pickle в 3–4 раза быстрее deepcopy, а распаковывается
+    только при откате (редко); если что-то не сериализуется — deepcopy."""
+    try:
+        buf = io.BytesIO()
+        _PagePickler(buf, page).dump(page.__dict__)
+        return buf.getvalue()
+    except Exception:
+        try:
+            return copy.deepcopy(page.__dict__, {id(page): page})
+        except Exception:
+            return None
+
+
+def _restore(page, snapshot) -> None:
+    state = _PageUnpickler(io.BytesIO(snapshot), page).load() if isinstance(snapshot, bytes) else snapshot
+    page.__dict__.clear()
+    page.__dict__.update(state)
+
+
 def parse_page_safely(page, settings: dict) -> bool:
     """Разбирает страницу; при ложных безрамочных таблицах — повторно без них.
     Возвращает True, если понадобился повторный разбор."""
     if not settings.get("parse_stream_table", True):
         page.parse(**settings)
         return False
-    try:
-        # memo: ссылки секций на саму страницу должны остаться ссылками на неё, а не на копию
-        backup = copy.deepcopy(page.__dict__, {id(page): page})
-    except Exception:
-        backup = None
+    backup = _snapshot(page)
     page.parse(**settings)
     if backup is None or not page_has_false_tables(page):
         return False
-    page.__dict__.clear()
-    page.__dict__.update(backup)
+    _restore(page, backup)
     page.parse(**{**settings, "parse_stream_table": False})
     return True
 

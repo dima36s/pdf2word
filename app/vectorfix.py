@@ -96,7 +96,58 @@ def install() -> None:
     Path._to_strokes = to_strokes
     Paths.to_shapes_and_images = to_shapes_and_images
     _install_rules()
+    _install_shading_rows()
+    _install_table_sections()
     _installed = True
+
+
+# --------------------------------------------------------------------------- «полосатые» таблицы
+
+def _install_shading_rows() -> None:
+    """Строки таблицы, разделённые только заливкой (через одну серая), — отдельные строки Word.
+
+    Перед поиском таблиц по линиям к ним добавляются невидимые (нулевой толщины) границы по краям
+    заливки ячеек (app/geometry.shading_row_borders); после разбора они убираются из слоя.
+    """
+    from pdf2docx.common.share import RectType
+    from pdf2docx.shape.Shape import Fill, Stroke
+    from pdf2docx.table.TablesConstructor import TablesConstructor
+
+    original = TablesConstructor.lattice_tables
+
+    def lattice_tables(self, connected_border_tolerance, min_border_clearance, max_border_width):
+        hidden = []
+        try:
+            hidden = _add_shading_rows(self._shapes, Fill, Stroke, RectType)
+        except Exception:
+            log.debug("shading rows skipped", exc_info=True)
+        try:
+            return original(self, connected_border_tolerance, min_border_clearance, max_border_width)
+        finally:
+            if hidden:
+                ids = {id(s) for s in hidden}
+                self._shapes.reset([s for s in self._shapes if id(s) not in ids])
+
+    TablesConstructor.lattice_tables = lattice_tables
+
+
+def _add_shading_rows(shapes, Fill, Stroke, RectType) -> list:
+    strokes = [s for s in shapes if isinstance(s, Stroke)]
+    fills = [tuple(s.bbox) for s in shapes if isinstance(s, Fill) and s.has_potential_type(RectType.SHADING)]
+    if len(strokes) < 4:
+        return []
+    h = [(s.y0, s.x0, s.x1) for s in strokes if s.horizontal]
+    v = [(s.x0, s.y0, s.y1) for s in strokes if s.vertical]
+    hidden = []
+    segments = [((x0, y), (x1, y)) for y, x0, x1 in geo.shading_row_borders(fills, h, v)]
+    segments += [((x, y0), (x, y1)) for x, y0, y1 in geo.band_bridges(h, v)]
+    for start, end in segments:
+        stroke = Stroke({"start": start, "end": end, "width": 0.0, "color": 0xFFFFFF})
+        stroke._potential_type = RectType.BORDER.value   # не подчёркивание и не зачёркивание
+        stroke._p2w_hidden = True
+        shapes.append(stroke)
+        hidden.append(stroke)
+    return hidden
 
 
 # --------------------------------------------------------------------------- одиночные линии
@@ -142,7 +193,7 @@ def _rule_geometry(shape) -> tuple[float, float, float, float, int] | None:
     from pdf2docx.shape.Shape import Fill, Stroke
 
     if isinstance(shape, Stroke):
-        if not shape.horizontal:
+        if not shape.horizontal or getattr(shape, "_p2w_hidden", False):
             return None
         return shape.x0, shape.x1, shape.y0, max(shape.width, 0.25), shape.color
     if isinstance(shape, Fill):
@@ -265,3 +316,96 @@ def _shapes_and_images(paths, min_svg_gap_dx, min_svg_gap_dy, min_w, min_h, clip
             images.append(ie.clip_page_to_dict(bbox=pymupdf.Rect(box), rm_image=True,
                                                clip_image_res_ratio=clip_image_res_ratio))
     return shapes, images
+
+
+# --------------------------------------------------------------------------- таблица — целиком
+
+TABLE_LINE = 3.0      # pt: тоньше — линия сетки (Word рисует их заливками)
+TABLE_TOUCH = 1.0     # pt: линии одной сетки касаются друг друга
+
+
+def table_clusters(boxes: list[tuple[float, float, float, float]]) -> list[tuple[list[int], tuple]]:
+    """Сетки таблиц: связные группы линий, где есть хотя бы по две горизонтали и вертикали.
+    Возвращает [(индексы линий, рамка сетки)]."""
+    from . import speedups
+
+    kinds = []
+    for x0, y0, x1, y1 in boxes:
+        w, h = x1 - x0, y1 - y0
+        kinds.append("v" if w <= TABLE_LINE and h > w else "h" if h <= TABLE_LINE and w > h else None)
+    idx = [i for i, k in enumerate(kinds) if k]
+    graph = speedups.rect_graph([boxes[i] for i in idx], [0] * len(idx), TABLE_TOUCH)
+    seen, out = set(), []
+    for start in range(len(idx)):
+        if start in seen:
+            continue
+        comp, stack = [], [start]
+        seen.add(start)
+        while stack:
+            k = stack.pop()
+            comp.append(idx[k])
+            for nb in graph[k]:
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        hs = sum(1 for i in comp if kinds[i] == "h")
+        if hs < 2 or len(comp) - hs < 2:
+            continue
+        box = (min(boxes[i][0] for i in comp), min(boxes[i][1] for i in comp),
+               max(boxes[i][2] for i in comp), max(boxes[i][3] for i in comp))
+        if box[2] - box[0] >= 20 and box[3] - box[1] >= 20:
+            out.append((sorted(comp), box))
+    return out
+
+
+def table_proxies(items: list[tuple[float, float, float, float]], lines: list[int]) -> dict[int, tuple]:
+    """Индекс элемента → рамка таблицы, к которой он относится (линия сетки или то, что внутри)."""
+    clusters = table_clusters([items[i] for i in lines])
+    if not clusters:
+        return {}
+    out: dict[int, tuple] = {}
+    for comp, box in clusters:
+        for k in comp:
+            out[lines[k]] = box
+    by_area = sorted((box for _, box in clusters), key=geo.area)
+    for i, (x0, y0, x1, y1) in enumerate(items):
+        if i in out:
+            continue
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        for box in by_area:              # самая маленькая сетка, внутри которой элемент
+            if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]:
+                out[i] = box
+                break
+    return out
+
+
+def _install_table_sections() -> None:
+    """Колонки листа pdf2docx ищет по строкам: в строке таблицы с объединённой ячейкой («415» на
+    несколько строк) левая граница и текст ячейки оказываются отдельными «колонками», и две
+    таблицы рядом рвались на два раздела — верх в две колонки, низ вложенной таблицей, которая
+    уже не помещалась на лист. При делении листа на разделы таблица считается одним блоком.
+    """
+    from pdf2docx.page.RawPage import RawPage
+    from pdf2docx.shape.Shape import Shape
+
+    from . import speedups
+
+    original = RawPage.parse_section
+
+    def parse_section(self, **settings):
+        proxy = None
+        try:
+            elems = list(self.blocks) + list(self.shapes)
+            items = [tuple(e.bbox) for e in elems]
+            lines = [i for i, e in enumerate(elems) if isinstance(e, Shape)]
+            found = table_proxies(items, lines)
+            proxy = {id(elems[i]): box for i, box in found.items()} or None
+        except Exception:
+            log.debug("table proxies skipped", exc_info=True)
+        token = speedups.GROUP_PROXY.set(proxy)
+        try:
+            return original(self, **settings)
+        finally:
+            speedups.GROUP_PROXY.reset(token)
+
+    RawPage.parse_section = parse_section

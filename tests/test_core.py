@@ -82,6 +82,19 @@ def test_table_cells_are_not_merged():
     assert len(normalize_text_blocks([block])[0]["lines"]) == 2
 
 
+def test_cells_split_by_table_line_are_not_merged():
+    # Word кончает текст ячейки пробелом («315 », «920х580 »): без учёта линий сетки
+    # строки соседних ячеек (и соседних таблиц) склеивались и выпадали из таблицы
+    from app.textfix import Barriers
+
+    block = {"type": 0, "lines": [_line("315 ", 0), _line("920х580 ", 60), _line("110 ", 200)]}
+    grid = Barriers([(40.0, 80, 120), (150.0, 80, 120)])
+    assert len(normalize_text_blocks([block], grid)[0]["lines"]) == 3
+    # линия выше строки (другая строка таблицы) — не мешает склейке
+    block = {"type": 0, "lines": [_line("Цифровая ", 0), _line("трансформация", 120)]}
+    assert len(normalize_text_blocks([block], Barriers([(80.0, 20, 60)]))[0]["lines"]) == 1
+
+
 def test_list_marker_joined_with_space():
     block = {"type": 0, "lines": [_line("1.", 0), _line("Анализ", 18)]}
     out = normalize_text_blocks([block])
@@ -248,6 +261,27 @@ def test_scan_ocr(tmp_path):
     d = Document(out)
     bold = [r.text for p in d.paragraphs for r in p.runs if r.bold]
     assert any("Введение" in t for t in bold)
+
+
+def _ocr_result(words, photos=()):
+    from app.ocr import Line, OcrResult, Paragraph, Word
+
+    ws = [Word(t, 10 * k, 10, 10 * k + 8, 20, conf) for k, (t, conf) in enumerate(words)]
+    return OcrResult([Paragraph([Line((0, 10, 800, 20), 20, 8, ws)])] if ws else [], list(photos))
+
+
+def test_picture_page_is_not_replaced_by_ocr_text():
+    """Обложка-фотоколлаж: с картинки читаются 5–7 слов — страница остаётся изображением."""
+    from app.ocr import looks_like_picture
+
+    cover = _ocr_result([("пецСтрои", 80), ("каталог", 95), ("Дегазационные", 70), ("керамика", 75),
+                         ("Абразивостойкая", 72), ("р", 30)], photos=[(0, 0, 800, 760)])
+    assert looks_like_picture(cover, 800, 1130)
+    assert looks_like_picture(_ocr_result([]), 800, 1130)
+    page = [(f"слово{k}", 92) for k in range(110)]
+    assert not looks_like_picture(_ocr_result(page), 800, 1130)
+    # страница текста с большой иллюстрацией — всё равно текст
+    assert not looks_like_picture(_ocr_result(page, photos=[(0, 0, 800, 700)]), 800, 1130)
 
 
 def test_scan_without_ocr_keeps_image(tmp_path):

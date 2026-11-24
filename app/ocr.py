@@ -634,9 +634,32 @@ def scan_png(prep: PreparedScan) -> bytes:
     return _png(prep.clean)
 
 
+PICTURE_MIN_WORDS = 8         # меньше осмысленных слов — распознавать нечего
+PICTURE_PHOTO_SHARE = 0.5     # фото занимает полстраницы и больше…
+PICTURE_PHOTO_WORDS = 40      # …а текста как на обложке, а не на странице документа
+
+
+def looks_like_picture(res: OcrResult, width: float, height: float) -> bool:
+    """Страница — иллюстрация (обложка, фотоколлаж), а не скан текста.
+
+    Такую страницу нельзя заменять распознанным текстом: фото выпало бы (оно больше 60 % листа),
+    а вместо него остались бы несколько слов, прочитанных с картинки.
+    """
+    words = [w for p in res.paragraphs for ln in p.lines for w in ln.words]
+    good = sum(1 for w in words if w.conf >= 60 and sum(c.isalpha() for c in w.text) >= 2)
+    if good < PICTURE_MIN_WORDS:
+        return True
+    area = max(width * height, 1.0)
+    photo = max(((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in res.photos), default=0.0)
+    return photo / area >= PICTURE_PHOTO_SHARE and good < PICTURE_PHOTO_WORDS
+
+
 def apply_hocr(doc: pymupdf.Document, index: int, prep: PreparedScan, hocr: bytes | str) -> int:
-    """Заменяет страницу index на собранную из hOCR. Возвращает число слов."""
+    """Заменяет страницу index на собранную из hOCR. Возвращает число слов;
+    0 — страница оказалась иллюстрацией и оставлена как есть (картинкой)."""
     res = parse_hocr(hocr)
+    if looks_like_picture(res, prep.img.width, prep.img.height):
+        return 0
     tmp = pymupdf.open()
     n = build_text_page(tmp, res, prep.img, prep.dpi, prep.h_rules, prep.v_rules, InkAnalyzer(prep.clean, prep.img))
     doc.insert_pdf(tmp, start_at=index)

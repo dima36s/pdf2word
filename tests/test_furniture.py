@@ -189,3 +189,30 @@ def test_caption_below_frame_goes_to_footer():
           _text(150, 760, 300, 775, "Санкт-Петербург"), _text(250, 805, 560, 815, "Е110-0162-АТХ.ОЛ_0_0_RU_IFC.docm")]
     (f,) = fu.detect([fu.PageElems(W, H, el)])
     assert f.footer is not None and f.footer[1] > 798 and f.footer[3] == H
+
+
+def _catalog_page(sheet: int, header_row: bool) -> fu.PageElems:
+    """Каталог из Word: картинка-плашка с названием вверху, полоса «стр. N» внизу, без рамки.
+    На листе с header_row таблица начинается строкой заголовков между двумя линиями."""
+    W, H = 595.3, 841.9
+    el = [fu.Elem((14, 12, 567, 48), "graphic"), _text(330, 16, 560, 26, "Труба футерованная"),
+          _text(300, 30, 560, 40, "ТУ 2296-002-26612968-2000"),
+          fu.Elem((1, 795, 594, 835), "graphic"), _text(510, 808, 545, 818, f"стр. {sheet}")]
+    if header_row:
+        el += [_line(40, 60, 555, 60), _line(40, 76, 555, 76), _line(40, 60, 40, 76), _line(330, 60, 330, 76),
+               _line(555, 60, 555, 76), _text(45, 63, 200, 73, "Крепеж для Ду 1,0МПа"),
+               _text(340, 63, 400, 73, "Ширина бурта, мм")]
+    for k in range(18 - sheet):
+        y = 90 + 7 * sheet + 26 * k
+        el += [_line(40, y, 555, y), _text(45, y + 4, 200, y + 14, f"Болт М{20 + k + 30 * sheet}")]
+    return fu.PageElems(W, H, el)
+
+
+def test_table_header_row_is_not_page_header():
+    """Повторяющийся низ листа (не штамп) не делает лист «бланком»: строка заголовков таблицы
+    под плашкой — часть таблицы, а не шапка, даже если над ней логотип и линия."""
+    pages = [_catalog_page(n, n == 3) for n in range(1, 6)]
+    result = fu.detect(pages)
+    f = result[2]
+    assert f.footer is not None and f.footer[1] > 780          # «стр. N» — в нижнем колонтитуле
+    assert f.header is not None and f.header[3] < 58           # шапка — только плашка

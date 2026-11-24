@@ -167,8 +167,8 @@ class Conversion:
             self.progress(5 + 40 * k / len(self.ocr_todo),
                           f"Распознаю текст: страница {i + 1} из {self.doc.page_count}")
             try:
-                ocr.ocr_replace_page(work, i, lang)
-                self.stats.ocr_pages += 1
+                if ocr.ocr_replace_page(work, i, lang):   # 0 — иллюстрация, осталась картинкой
+                    self.stats.ocr_pages += 1
             except ocr.OcrError as exc:
                 log.warning("OCR failed on page %s: %s", i + 1, exc)
                 self.ocr_failed(i)
@@ -183,8 +183,8 @@ class Conversion:
         """Браузер: собрать страницу из hOCR, полученного от Tesseract.js."""
         prep = self._prepared.pop(i)
         try:
-            ocr.apply_hocr(self._ensure_work(), i, prep, hocr)
-            self.stats.ocr_pages += 1
+            if ocr.apply_hocr(self._ensure_work(), i, prep, hocr):
+                self.stats.ocr_pages += 1
         except Exception as exc:
             log.warning("OCR apply failed on page %s: %s", i + 1, exc)
             self.ocr_failed(i)
