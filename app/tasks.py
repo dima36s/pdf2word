@@ -7,6 +7,7 @@
     progress.json  прогресс от рабочего процесса
     result.json    итог от рабочего процесса
     result.docx    готовый документ
+    result.xlsx    таблицы и текст в Excel (если было что выгрузить)
 Состояние хранится в файлах, поэтому его видят все процессы сервера.
 """
 from __future__ import annotations
@@ -173,7 +174,7 @@ class Runner:
 
     async def _execute(self, task_id: str, options: dict) -> None:
         d = self.store.dir(task_id)
-        for name in ("progress.json", "result.json", "result.docx"):
+        for name in ("progress.json", "result.json", "result.docx", "result.xlsx"):
             (d / name).unlink(missing_ok=True)
         self.store.update(task_id, status="processing", started=time.time(), error=None, stats=None)
         proc = self.ctx.Process(target=worker_main, args=(str(d), options), daemon=True)

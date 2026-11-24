@@ -8,7 +8,7 @@
  *   prepare  {key, page}         подготовить скан → PNG для Tesseract.js
  *   apply    {key, page, hocr}   собрать страницу из hOCR
  *   skip     {key, page}         распознать не удалось — оставить страницу картинкой
- *   finish   {key}               собрать DOCX
+ *   finish   {key}               собрать DOCX (и XLSX с таблицами)
  *   zip      {files:[{name,data}]}
  *   drop     {key}               освободить память
  * Прогресс: {event:"progress", key, pct, stage}; загрузка: {event:"boot", pct, stage}
@@ -124,6 +124,7 @@ self.onmessage = async (e) => {
       case "finish":
         result = call("finish", { key: e.data.key });
         transfer.push(result.docx.buffer);
+        if (result.xlsx) transfer.push(result.xlsx.buffer);
         break;
       case "zip":
         result = call("make_zip", { files: e.data.files.map((f) => [f.name, new Uint8Array(f.data)]) });

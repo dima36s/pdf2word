@@ -154,3 +154,39 @@ def test_inline_logo_keeps_its_height():
     band = headers.prepare(d)
     sp = band.elements[0].find(f"{qn('w:pPr')}/{qn('w:spacing')}")
     assert sp is None or sp.get(qn("w:lineRule")) != "exact"
+
+
+def test_header_columns_become_borderless_table():
+    """pdf2docx кладёт «логотип | название организации» в два раздела-колонки; в колонтитуле
+    разделов нет — блоки стоят рядом в таблице без границ, а не друг под другом."""
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls, qn
+
+    d = Document()
+    logo = d.add_paragraph()
+    logo.add_run().add_picture(io.BytesIO(PNG))
+    logo.paragraph_format.space_after = Pt(26)
+
+    def end_section(kind: str) -> None:
+        p = d.add_paragraph()
+        p._p.get_or_add_pPr().append(parse_xml(
+            f'<w:sectPr {nsdecls("w")}><w:type w:val="{kind}"/><w:pgSz w:w="11906" w:h="16838"/>'
+            '<w:cols w:num="2" w:equalWidth="0"><w:col w:w="3467" w:space="0"/>'
+            '<w:col w:w="6398" w:space="0"/></w:cols></w:sectPr>'))
+
+    end_section("continuous")
+    d.add_paragraph("Общество с ограниченной ответственностью")
+    end_section("nextColumn")
+    d.add_paragraph("Е110-0162-АТХ.ОЛ")
+    band = headers.prepare(d)
+    tables = [el for el in band.elements if el.tag == qn("w:tbl")]
+    assert len(tables) == 1
+    cells = tables[0].findall(f"{qn('w:tr')}/{qn('w:tc')}")
+    assert len(cells) == 2
+    assert next(cells[0].iter(qn("w:drawing")), None) is not None
+    assert "Общество" in "".join(t.text or "" for t in cells[1].iter(qn("w:t")))
+    assert [g.get(qn("w:w")) for g in tables[0].iter(qn("w:gridCol"))] == ["3467", "6398"]
+    assert not any(el.find(f".//{qn('w:sectPr')}") is not None for el in band.elements)
+    # отступ под логотипом — после таблицы, чтобы название встало по середине логотипа
+    after = band.elements[band.elements.index(tables[0]) + 1]
+    assert after.find(f"{qn('w:pPr')}/{qn('w:spacing')}").get(qn("w:before")) == str(26 * 20 - 20)

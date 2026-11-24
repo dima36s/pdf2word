@@ -118,6 +118,113 @@ def _zero_space_before(p) -> None:
             sp.attrib.pop(w(attr), None)
 
 
+def _section_layout(sp) -> tuple[str, list[int]]:
+    """(тип начала, ширины колонок в twips) по w:sectPr раздела pdf2docx."""
+    if sp is None:
+        return "nextPage", []
+    t = sp.find(w("type"))
+    kind = t.get(w("val"), "nextPage") if t is not None else "nextPage"
+    cols = sp.find(w("cols"))
+    try:
+        num = int(cols.get(w("num"), "1")) if cols is not None else 1
+    except ValueError:
+        num = 1
+    if num < 2:
+        return kind, []
+    widths = [int(float(c.get(w("w"), "0"))) for c in cols.findall(w("col"))]
+    if len(widths) != num or not all(widths):
+        size, mar = sp.find(w("pgSz")), sp.find(w("pgMar"))
+        try:
+            text = int(size.get(w("w"))) - int(mar.get(w("left"))) - int(mar.get(w("right")))
+        except (AttributeError, TypeError, ValueError):
+            text = 9000
+        widths = [text // num] * num
+    return kind, widths
+
+
+def _has_content(elems) -> bool:
+    return any(el.tag == w("tbl") or any((t.text or "").strip() for t in el.iter(w("t")))
+               or next(el.iter(f"{{{WP}}}inline"), None) is not None for el in elems)
+
+
+def _layout_table(chunks: list[list], widths: list[int]):
+    """Блоки рядом — таблица без границ в одну строку (в колонтитуле разделов с колонками нет)."""
+    tbl = etree.SubElement(etree.Element(w("body")), w("tbl"))
+    pr = etree.SubElement(tbl, w("tblPr"))
+    etree.SubElement(pr, w("tblW"), {w("w"): str(sum(widths)), w("type"): "dxa"})
+    etree.SubElement(pr, w("tblLayout"), {w("type"): "fixed"})
+    borders = etree.SubElement(pr, w("tblBorders"))
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        etree.SubElement(borders, w(side), {w("val"): "nil"})
+    mar = etree.SubElement(pr, w("tblCellMar"))
+    for side in ("left", "right"):
+        etree.SubElement(mar, w(side), {w("w"): "0", w("type"): "dxa"})
+    grid = etree.SubElement(tbl, w("tblGrid"))
+    for width in widths:
+        etree.SubElement(grid, w("gridCol"), {w("w"): str(width)})
+    tr = etree.SubElement(tbl, w("tr"))
+    gap = 0
+    for k, width in enumerate(widths):
+        tc = etree.SubElement(tr, w("tc"))
+        tcpr = etree.SubElement(tc, w("tcPr"))
+        etree.SubElement(tcpr, w("tcW"), {w("w"): str(width), w("type"): "dxa"})
+        # блоки по центру строки (название организации — по середине логотипа), а интервал под
+        # последним абзацем — отступ до текста ниже — выносится за таблицу
+        etree.SubElement(tcpr, w("vAlign"), {w("val"): "center"})
+        for el in chunks[k] if k < len(chunks) else []:
+            tc.append(el)
+        while len(tc) > 1 and tc[-1].tag == w("p") and not _has_content([tc[-1]]):
+            tc.remove(tc[-1])                # пустые абзацы-отступы в конце колонки
+        last = tc[-1] if len(tc) > 1 else None
+        if last is not None and last.tag == w("p"):
+            sp = last.find(f"{w('pPr')}/{w('spacing')}")
+            if sp is not None:
+                try:
+                    gap = max(gap, int(float(sp.get(w("after"), "0"))))
+                except ValueError:
+                    pass
+                sp.set(w("after"), "0")
+        if tc[-1].tag != w("p"):
+            etree.SubElement(tc, w("p"))     # ячейка Word кончается абзацем
+    if gap <= 20:
+        return [tbl]
+    spacer = etree.Element(w("p"))
+    ppr = etree.SubElement(spacer, w("pPr"))
+    etree.SubElement(ppr, w("spacing"), {w("before"): str(gap - 20), w("after"): "0", w("line"): "20",
+                                         w("lineRule"): "exact"})
+    return [tbl, spacer]
+
+
+def _columns_as_tables(elements: list) -> list:
+    """pdf2docx раскладывает блоки рядом (логотип и название организации) по колонкам — разделам
+    «с новой колонки». В колонтитуле разделов нет: колонки шли бы друг под другом, поэтому они
+    становятся таблицей без границ."""
+    sections, current = [], []
+    for el in elements:
+        current.append(el)
+        sp = el.find(f"{w('pPr')}/{w('sectPr')}") if el.tag == w("p") else None
+        if sp is not None:
+            sections.append((current, sp))
+            current = []
+    if current:
+        sections.append((current, None))
+    groups: list[tuple[list[int], list[list]]] = []
+    for elems, sp in sections:
+        kind, widths = _section_layout(sp)
+        if widths and kind == "nextColumn" and groups and groups[-1][0]:
+            groups[-1][1].append(elems)
+        else:
+            groups.append((widths, [elems]))
+    out: list = []
+    for widths, chunks in groups:
+        if widths and len(chunks) == len(widths) and sum(1 for c in chunks if _has_content(c)) >= 2:
+            out.extend(_layout_table(chunks, widths))
+        else:
+            for c in chunks:
+                out.extend(c)
+    return out
+
+
 def prepare(src_doc, floating: list | None = None) -> Band:
     """Содержимое тела документа src_doc → элементы для колонтитула."""
     body = src_doc.element.body
@@ -125,6 +232,11 @@ def prepare(src_doc, floating: list | None = None) -> Band:
     for el in body:
         if el.tag in (w("p"), w("tbl")):
             band.elements.append(copy.deepcopy(el))
+    original = {id(el) for el in band.elements if el.tag == w("tbl")}
+    try:
+        band.elements = _columns_as_tables(band.elements)
+    except Exception:
+        log.debug("header columns kept as is", exc_info=True)
     for el in band.elements:
         for sp in list(el.iter(w("sectPr"))):
             sp.getparent().remove(sp)
@@ -167,7 +279,8 @@ def prepare(src_doc, floating: list | None = None) -> Band:
     if band.elements and band.elements[0].tag == w("p"):
         _zero_space_before(band.elements[0])
     if floating:
-        tables = [el for el in band.elements if el.tag == w("tbl")]
+        # таблицы-раскладки колонок в pdf2docx не было — у них нет координат
+        tables = [el for el in band.elements if el.tag == w("tbl") and id(el) in original]
         for tbl, bbox in zip(tables, floating):
             floating_table(tbl, bbox)
     return band

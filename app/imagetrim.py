@@ -62,6 +62,59 @@ def trim_white_margins(raw: dict) -> dict:
             "width": cw if same else ch, "height": ch if same else cw}
 
 
+PATTERN_MIN = 5.0          # pt: меньше — не плашка, а точка
+PATTERN_MAX_SHARE = 0.6    # заливка на весь лист — фон, её не растрируем (текст и линии уже есть)
+
+
+def _image_info(page) -> list:
+    """page.get_image_info без xref-картинок: страница разбирается несколькими проходами (тело,
+    шапка, низ, боковой штамп), а отрисовка списка картинок недешёвая — кэш на документе."""
+    doc = page.parent
+    try:
+        cache = doc.__dict__.setdefault("_p2w_pattern_info", {})
+    except (AttributeError, TypeError):
+        cache = {}
+    if page.number not in cache:
+        try:
+            cache[page.number] = [i for i in page.get_image_info(xrefs=True) if not i.get("xref")]
+        except Exception:
+            cache[page.number] = []
+    return cache[page.number]
+
+
+def pattern_images(page, images: list, ratio: float) -> list:
+    """Градиенты, заливки узором и встроенные (inline) картинки как картинки pdf2docx.
+
+    pdf2docx берёт только картинки-объекты (page.get_images): градиентная плашка под шапкой
+    каталога (заливка узором /Pattern) и встроенные картинки пропадали. MuPDF при отрисовке
+    сообщает о них как о картинках без xref — эти места рендерятся без текста, как это делает
+    сам pdf2docx для векторных рисунков.
+    """
+    import pymupdf
+    from pdf2docx.image.ImagesExtractor import ImagesExtractor
+
+    infos = _image_info(page)
+    if not infos:
+        return []
+    have = [pymupdf.Rect(im["bbox"]) for im in images if im.get("bbox")]
+    limit = PATTERN_MAX_SHARE * abs(page.rect)
+    out = []
+    for info in infos:
+        if info.get("xref"):
+            continue          # обычная картинка — её уже взял pdf2docx
+        r = pymupdf.Rect(info["bbox"]) & page.rect
+        if r.is_empty or r.width < PATTERN_MIN or r.height < PATTERN_MIN or abs(r) > limit:
+            continue
+        if any(abs(r & h) > 0.5 * abs(r) for h in have):
+            continue
+        try:
+            out.append(ImagesExtractor(page).clip_page_to_dict(r, False, ratio))
+            have.append(r)
+        except Exception:
+            log.debug("pattern image skipped", exc_info=True)
+    return out
+
+
 def trim_images(images: list) -> list:
     out = []
     for raw in images:

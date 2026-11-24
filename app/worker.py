@@ -54,7 +54,8 @@ def worker_main(task_dir: str, options: dict) -> None:
             pass
 
     try:
-        stats = convert_pdf(d / "input.pdf", d / "result.docx", ConvertOptions(**options), progress)
+        stats = convert_pdf(d / "input.pdf", d / "result.docx", ConvertOptions(**options), progress,
+                            xlsx_dst=d / "result.xlsx")
         _write_json(d / "result.json", {"ok": True, "stats": stats.to_dict()})
     except ConversionError as exc:
         _write_json(d / "result.json", {"ok": False, "error": str(exc)})

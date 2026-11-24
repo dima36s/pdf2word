@@ -38,7 +38,7 @@
 | PyMuPDF (MuPDF) | **AGPL-3.0** или коммерческая лицензия Artifex |
 | pdf2docx | MIT |
 | Tesseract OCR | Apache-2.0 |
-| FastAPI, uvicorn, python-docx, Pillow, numpy, OpenCV | MIT / BSD / Apache-2.0 |
+| FastAPI, uvicorn, python-docx, openpyxl, Pillow, numpy, OpenCV | MIT / BSD / Apache-2.0 |
 | Шрифты Liberation | SIL OFL 1.1 |
 
 > **PyMuPDF версии 2.x не использовать.** Начиная с 2.0 она тянет обязательную зависимость

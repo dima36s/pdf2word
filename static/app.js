@@ -266,6 +266,14 @@
       a.href = `api/tasks/${t.id}/download`;
       a.textContent = "Скачать DOCX";
       actions.appendChild(a);
+      if (t.has_xlsx) {
+        const x = document.createElement("a");
+        x.className = "btn btn-ghost btn-xlsx";
+        x.href = `api/tasks/${t.id}/download?format=xlsx`;
+        x.textContent = "Excel";
+        x.title = "Таблицы и текст в Excel (.xlsx), лист на каждую страницу";
+        actions.appendChild(x);
+      }
     } else if (st === "error" && !needPw) {
       const b = document.createElement("button");
       b.className = "btn btn-ghost"; b.type = "button"; b.textContent = "Повторить";

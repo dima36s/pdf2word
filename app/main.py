@@ -81,10 +81,16 @@ async def guard(request: Request, call_next):
 
 # --------------------------------------------------------------------------- helpers
 
-def _output_name(name: str) -> str:
+def _output_name(name: str, ext: str = ".docx") -> str:
     stem = Path(name).stem or "document"
     stem = re.sub(r'[\x00-\x1f\\/:*?"<>|]+', "_", stem).strip(" .") or "document"
-    return stem[:150] + ".docx"
+    return stem[:150] + ext
+
+
+FORMATS = {
+    "docx": ("result.docx", ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    "xlsx": ("result.xlsx", ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+}
 
 
 def _public(meta: dict) -> dict:
@@ -93,6 +99,7 @@ def _public(meta: dict) -> dict:
                                     "status", "error", "stats", "output_size", "created")}
     out["has_thumb"] = (store.dir(task_id) / "thumb.png").is_file()
     out["output_name"] = _output_name(meta["name"])
+    out["has_xlsx"] = meta.get("status") == "done" and (store.dir(task_id) / "result.xlsx").is_file()
     out["expires_at"] = meta["created"] + settings.file_ttl_min * 60
     if meta.get("status") == "processing":
         prog = store.read_json(task_id, "progress.json") or {}
@@ -263,13 +270,16 @@ async def convert(task_id: str, body: ConvertRequest) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/download")
-def download(task_id: str):
+def download(task_id: str, fmt: str = Query("docx", alias="format", pattern="^(docx|xlsx)$")):
+    """Готовый документ: format=docx (Word) или format=xlsx (таблицы и текст в Excel)."""
     meta = _get(task_id)
-    path = store.dir(task_id) / "result.docx"
-    if meta.get("status") != "done" or not path.is_file():
+    file_name, ext, media = FORMATS[fmt]
+    path = store.dir(task_id) / file_name
+    if meta.get("status") != "done" or (fmt == "docx" and not path.is_file()):
         raise HTTPException(409, "Документ ещё не готов.")
-    return FileResponse(path, filename=_output_name(meta["name"]),
-                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    if not path.is_file():
+        raise HTTPException(404, "Выгрузки в Excel для этого документа нет.")
+    return FileResponse(path, filename=_output_name(meta["name"], ext), media_type=media)
 
 
 @app.delete("/api/tasks/{task_id}", status_code=204)

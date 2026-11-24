@@ -67,6 +67,15 @@ def test_full_cycle(client):
     assert "filename*=utf-8''" in r.headers["content-disposition"].lower()
     assert zipfile.ZipFile(io.BytesIO(r.content)).read("word/document.xml")
 
+    # таблицы и текст — в Excel
+    assert st["has_xlsx"] and st["stats"]["xlsx_sheets"] == 3
+    r = client.get(f"/api/tasks/{task['id']}/download?format=xlsx")
+    assert r.status_code == 200
+    assert "spreadsheetml" in r.headers["content-type"]
+    assert ".xlsx" in r.headers["content-disposition"]
+    assert zipfile.ZipFile(io.BytesIO(r.content)).read("xl/workbook.xml")
+    assert client.get(f"/api/tasks/{task['id']}/download?format=pdf").status_code == 422
+
     r = client.get(f"/api/zip?ids={task['id']}")
     assert r.status_code == 200
     names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()

@@ -314,6 +314,13 @@ def install() -> None:
 
     def _preprocess_images(self, **settings):
         images = original_images(self, **settings)
+        if settings.get("ocr") != 2:
+            from .imagetrim import pattern_images
+            try:
+                images = images + pattern_images(self.page_engine, images,
+                                                 settings.get("clip_image_res_ratio", 3.0))
+            except Exception:
+                log.debug("pattern images failed", exc_info=True)
         try:
             images = filter_images(self.page_engine, images)
         except Exception:

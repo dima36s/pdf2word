@@ -6,7 +6,7 @@
 Что попадает в сайт:
   * web/*                 интерфейс и Web Worker
   * pyodide/              Python в WebAssembly + нужные пакеты (PyMuPDF, OpenCV, lxml, numpy, Pillow…)
-  * wheels/               python-docx и pdf2docx (чистый Python, с PyPI)
+  * wheels/               python-docx, pdf2docx, openpyxl (чистый Python, с PyPI)
   * app.zip               код конвертера из app/ (тот же, что на сервере)
   * tesseract/            Tesseract.js, ядро WebAssembly и модели rus/eng
   * fonts/                Liberation Serif — шрифт распознанного текста
@@ -33,14 +33,14 @@ PYODIDE_VERSION = "0.28.3"            # Python 3.13, в комплекте PyMuP
 PYODIDE_PACKAGES = ["numpy", "opencv-python", "lxml", "pillow", "pymupdf", "fonttools", "typing-extensions"]
 PYODIDE_CORE_FILES = ["pyodide.js", "pyodide.mjs", "pyodide.asm.js", "pyodide.asm.wasm", "python_stdlib.zip",
                       "pyodide-lock.json", "package.json"]
-PY_WHEELS = ["python-docx==1.2.0", "pdf2docx==0.5.13"]
+PY_WHEELS = ["python-docx==1.2.0", "pdf2docx==0.5.13", "openpyxl==3.1.5", "et-xmlfile==2.0.0"]
 TESSERACT_JS = "7.0.0"
 TESSERACT_CORES = ["tesseract-core-relaxedsimd-lstm.wasm.js", "tesseract-core-simd-lstm.wasm.js",
                    "tesseract-core-lstm.wasm.js"]
 OCR_LANGS = ["rus", "eng"]
 APP_MODULES = ["__init__.py", "config.py", "converter.py", "docxfix.py", "furniture.py", "geometry.py", "headers.py",
                "imagetrim.py", "ocr.py", "pdftools.py", "regionfix.py", "speedups.py", "textfix.py", "vectorfix.py",
-               "webapi.py"]
+               "webapi.py", "xlsxexport.py"]
 FONT_DIRS = ["/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/liberation2",
              "/usr/share/fonts/liberation-serif", "/usr/share/fonts/liberation"]
 FONTS = ["LiberationSerif-Regular.ttf", "LiberationSerif-Bold.ttf"]
@@ -126,7 +126,7 @@ def build(out: Path, cache: Path, pyodide_dir: Path | None) -> None:
             sys.exit(f"sha256 mismatch: {p['file_name']}")
     log(f"pyodide {PYODIDE_VERSION}: {', '.join(p['name'] for p in pkgs)}")
 
-    # 3. python-docx, pdf2docx
+    # 3. python-docx, pdf2docx, openpyxl
     wheels = out / "wheels"
     wheels.mkdir()
     subprocess.run([sys.executable, "-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:",

@@ -95,11 +95,12 @@ def skip(key: str, page: int) -> bool:
 def finish(key: str) -> dict:
     conv = _sessions.pop(key)
     out = WORK / f"{key}.docx"
+    xlsx = WORK / f"{key}.xlsx"
     try:
-        stats = conv.finish(out)
+        stats = conv.finish(out, xlsx_dst=xlsx)
     finally:
         conv.close()
-    return {"docx": _read_and_remove(out), "stats": stats.to_dict()}
+    return {"docx": _read_and_remove(out), "xlsx": _read_and_remove(xlsx), "stats": stats.to_dict()}
 
 
 def make_zip(files: list) -> bytes:
@@ -120,7 +121,7 @@ def drop(key: str, keep_source: bool = False) -> bool:
     conv = _sessions.pop(key, None)
     if conv is not None:
         conv.close()
-    names = [f"{key}.docx", f"{key}.png"] + ([] if keep_source else [f"{key}.pdf"])
+    names = [f"{key}.docx", f"{key}.xlsx", f"{key}.png"] + ([] if keep_source else [f"{key}.pdf"])
     for name in names:
         (WORK / name).unlink(missing_ok=True)
     return True

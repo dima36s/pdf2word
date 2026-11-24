@@ -6,6 +6,7 @@
   const $ = (sel, el = document) => el.querySelector(sel);
   const MAX_FILE_MB = 200;
   const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
   const abs = (p) => new URL(p, location.href).href;
 
   const el = {
@@ -43,7 +44,7 @@
     setTimeout(() => t.remove(), 5000);
   };
   const isPdf = (f) => /\.pdf$/i.test(f.name) || f.type === "application/pdf";
-  const docxName = (name) => (name.replace(/\.pdf$/i, "").replace(/[\\/:*?"<>|]+/g, "_").trim() || "document") + ".docx";
+  const docxName = (name, ext = ".docx") => (name.replace(/\.pdf$/i, "").replace(/[\\/:*?"<>|]+/g, "_").trim() || "document") + ext;
   const saveBlob = (blob, name) => {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -141,7 +142,7 @@
       const item = {
         key: `f${Date.now().toString(36)}${(++seq).toString(36)}`, file: f, name: f.name, size: f.size,
         status: "reading", info: null, thumbUrl: null, password: "", unlocked: false, pages: "",
-        error: "", progress: 0, stage: "", blob: null, url: null, stats: null,
+        error: "", progress: 0, stage: "", blob: null, xlsx: null, url: null, stats: null,
       };
       state.files.push(item);
       mountCard(item);
@@ -256,8 +257,9 @@
           await rpc("skip", { key: item.key, page });
         }
       }
-      const { docx, stats } = await rpc("finish", { key: item.key });
+      const { docx, xlsx, stats } = await rpc("finish", { key: item.key });
       item.blob = new Blob([docx], { type: DOCX_MIME });
+      item.xlsx = xlsx ? new Blob([xlsx], { type: XLSX_MIME }) : null;
       item.url = URL.createObjectURL(item.blob);
       item.stats = stats;
       item.status = "done";
@@ -373,6 +375,13 @@
       b.className = "btn btn-ok"; b.type = "button"; b.textContent = "Скачать DOCX";
       b.addEventListener("click", () => saveBlob(item.blob, docxName(item.name)));
       actions.appendChild(b);
+      if (item.xlsx) {
+        const x = document.createElement("button");
+        x.className = "btn btn-ghost btn-xlsx"; x.type = "button"; x.textContent = "Excel";
+        x.title = "Таблицы и текст в Excel (.xlsx), лист на каждую страницу";
+        x.addEventListener("click", () => saveBlob(item.xlsx, docxName(item.name, ".xlsx")));
+        actions.appendChild(x);
+      }
     } else if (st === "error" && !needPw && !item.broken) {
       const b = document.createElement("button");
       b.className = "btn btn-ghost"; b.type = "button"; b.textContent = "Повторить";

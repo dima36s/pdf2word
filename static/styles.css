@@ -172,6 +172,7 @@ main { flex: 1; width: 100%; max-width: 1240px; margin: 0 auto; padding: 0 24px 
 .card-info { color: var(--warn); background: var(--warn-50); font-size: 12px; padding: 7px 9px; border-radius: 8px; line-height: 1.4; }
 .card-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .card-actions .btn { font-size: 13.5px; padding: 9px 12px; flex: 1; }
+.card-actions .btn-xlsx { flex: none; }
 
 .pw { display: flex; gap: 6px; min-width: 0; }
 .pw input { width: 100%; }

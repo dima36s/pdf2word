@@ -80,6 +80,7 @@ class ConvertStats:
     tables: int = 0
     images: int = 0
     headers: int = 0                # колонтитулов из шапки/штампа листа
+    xlsx_sheets: int = 0            # листов в выгрузке Excel (0 — не выгружали или нечего)
     seconds: float = 0.0
     warnings: list[str] = field(default_factory=list)
 
@@ -194,7 +195,8 @@ class Conversion:
         self.stats.warnings.append(f"Страница {i + 1}: не удалось распознать текст, вставлена картинкой.")
 
     # ------------------------------------------------------------------ основной разбор
-    def finish(self, dst: Path) -> ConvertStats:
+    def finish(self, dst: Path, xlsx_dst: Path | None = None) -> ConvertStats:
+        """Собирает DOCX в dst; с xlsx_dst — ещё и таблицы с текстом в Excel (app/xlsxexport.py)."""
         from pdf2docx import Converter  # импорт здесь: тяжёлый
         from pdf2docx.page.Pages import Pages
 
@@ -290,7 +292,7 @@ class Conversion:
                 self._furniture_off = True
                 stats.warnings[:] = warnings_before
                 stats.headers = 0
-                return self.finish(dst)
+                return self.finish(dst, xlsx_dst)
         try:
             from .docxfix import fit_pages
             fit_pages(docx)       # лист PDF — одна страница Word (после колонтитулов: они занимают место)
@@ -307,6 +309,10 @@ class Conversion:
             os.replace(tmp, dst)
         finally:
             tmp.unlink(missing_ok=True)
+
+        if xlsx_dst is not None:
+            progress(99, "Выгружаю таблицы в Excel")
+            stats.xlsx_sheets = export_xlsx(dst, Path(xlsx_dst), [i + 1 for i in made])
 
         stats.seconds = round(time.monotonic() - self.t0, 2)
         progress(100, "Готово")
@@ -459,14 +465,28 @@ class _FurniturePlan:
     distances: dict = field(default_factory=dict)
 
 
-def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn = _noop) -> ConvertStats:
-    """Полная конвертация (серверная версия)."""
+def convert_pdf(src: Path, dst: Path, opts: ConvertOptions, progress: ProgressFn = _noop,
+                xlsx_dst: Path | None = None) -> ConvertStats:
+    """Полная конвертация (серверная версия); xlsx_dst — заодно выгрузка в Excel."""
     conv = Conversion(src, opts, progress)
     try:
         conv.run_ocr()
-        return conv.finish(dst)
+        return conv.finish(dst, xlsx_dst)
     finally:
         conv.close()
+
+
+def export_xlsx(docx_path: Path, xlsx_path: Path, page_numbers: list[int] | None = None) -> int:
+    """Excel по готовому DOCX. Сбой выгрузки не портит конвертацию: Word уже готов.
+    Возвращает число листов (0 — файла нет)."""
+    xlsx_path.unlink(missing_ok=True)
+    try:
+        from .xlsxexport import docx_to_xlsx
+        return docx_to_xlsx(docx_path, xlsx_path, page_numbers)
+    except Exception:
+        log.exception("xlsx export failed")
+        xlsx_path.unlink(missing_ok=True)
+        return 0
 
 
 def _finalize_docx(docx, title: str | None) -> None:
