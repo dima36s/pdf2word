@@ -190,3 +190,18 @@ def test_header_columns_become_borderless_table():
     # отступ под логотипом — после таблицы, чтобы название встало по середине логотипа
     after = band.elements[band.elements.index(tables[0]) + 1]
     assert after.find(f"{qn('w:pPr')}/{qn('w:spacing')}").get(qn("w:before")) == str(26 * 20 - 20)
+
+
+def test_empty_header_after_real_one_stays_inside_margin(tmp_path):
+    # лист А3 со штампом: поле сверху 15 pt, своей шапки нет; пустой колонтитул на 36 pt
+    # сдвигал бы текст вниз и лист переезжал на следующую страницу
+    d = _main(2)
+    d.sections[1].top_margin = Pt(15)
+    d.sections[1].bottom_margin = Pt(13)
+    contents = {0: {"header": headers.prepare(_band_doc(1)), "footer": headers.prepare(_band_doc(1))}}
+    headers.attach(list(zip([0, 1], d.sections)), contents, {})
+    out = tmp_path / "m.docx"
+    d.save(out)
+    s0, s1 = Document(out).sections
+    assert s1.header_distance.pt <= 13.0 and s1.footer_distance.pt <= 11.0
+    assert s0.header_distance.pt > 30                     # у листа с шапкой расстояние прежнее

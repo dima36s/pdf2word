@@ -258,7 +258,8 @@ BAND_MIN_COLUMNS = 3       # столько вертикалей должно п
 
 
 def band_bridges(h_lines: Sequence[HLine], v_lines: Sequence[VLine],
-                 max_gap: float = BAND_MAX_GAP, tol: float = 1.0) -> list[VLine]:
+                 max_gap: float = BAND_MAX_GAP, tol: float = 1.0,
+                 texts: Sequence[Box] = ()) -> list[VLine]:
     """Невидимые вертикали через строку таблицы, нарисованную без вертикальных линий.
 
     В каталогах Word строка-подзаголовок группы («Ду215», «Ду265»…) идёт на всю ширину без
@@ -266,6 +267,9 @@ def band_bridges(h_lines: Sequence[HLine], v_lines: Sequence[VLine],
     а подзаголовки — абзацами между ними. Если на одной высоте прерываются сразу несколько
     вертикалей, а сверху и снизу просвет закрыт горизонталями на всю ширину, — это строка той же
     таблицы: вертикали продолжаются через неё (невидимыми).
+
+    Если текст строки пересекает место такой вертикали («8.1.4. Перегрузочный узел тракта подачи
+    руды» по центру через все графы), это объединённая ячейка-заголовок — её не делим.
     """
     by_band: dict[tuple[int, int], list[VLine]] = {}
     by_x: dict[int, list[VLine]] = {}
@@ -290,9 +294,46 @@ def band_bridges(h_lines: Sequence[HLine], v_lines: Sequence[VLine],
         lo, hi = xs[0], xs[-1]
         if (_covered(top, lo, hi, h_lines, 1.5) < 0.9 or _covered(bottom, lo, hi, h_lines, 1.5) < 0.9):
             continue
+        inner = [x for x in xs if lo + tol < x < hi - tol]
+        band_texts = [t for t in texts if t[1] < bottom and t[3] > top and t[0] < hi and t[2] > lo]
+        keep = set(xs) - set(inner) | set(split_points(inner, band_texts, tol))
+        if inner and not keep & set(inner):
+            continue          # текст через границы граф — строка-заголовок на всю ширину
         seen = set()
         for x, y0, y1 in sorted(bridges):
-            if round(x, 1) not in seen:
+            if round(x, 1) in keep and round(x, 1) not in seen:
                 seen.add(round(x, 1))
                 out.append((x, y0, y1))
+    return out
+
+
+def text_chunks(spans: Sequence[tuple[Box, float]], gap_em: float = 0.6) -> list[Box]:
+    """Склеить соседние фрагменты строки (рамка, кегль) в куски: промежуток меньше 0,6 кегля — тот же
+    кусок текста (пробел между словами), больше — разные графы."""
+    out: list[list[float]] = []
+    for box, size in sorted(spans, key=lambda s: s[0][0]):
+        if out and box[0] - out[-1][2] <= gap_em * max(size, 1.0):
+            cur = out[-1]
+            cur[1], cur[2], cur[3] = min(cur[1], box[1]), max(cur[2], box[2]), max(cur[3], box[3])
+        else:
+            out.append(list(box))
+    return [tuple(b) for b in out]
+
+
+def split_points(inner: Sequence[float], texts: Sequence[Box], tol: float = 1.0) -> list[float]:
+    """Какие границы граф провести через строку без вертикалей.
+
+    Если текст не пересекает ни одной границы — все (обычная строка сетки: «Ду215», «40», «16» каталога
+    стоят каждый в своей графе). Если заголовок идёт через границы граф, проводятся только
+    непересечённые границы, по обе стороны от которых есть текст: «8.1.4. Перегрузочный узел…» по
+    центру — одна ячейка на всю ширину; «Итого по разделу | 40 | 16» — заголовок и значения."""
+    crossed = {x for x in inner for t in texts if t[0] < x - tol and t[2] > x + tol}
+    if not crossed:
+        return list(inner)
+    out = []
+    for x in inner:
+        if any(t[0] < x - tol and t[2] > x + tol for t in texts):
+            continue
+        if any(t[2] <= x + tol for t in texts) and any(t[0] >= x - tol for t in texts):
+            out.append(x)
     return out

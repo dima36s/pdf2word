@@ -564,7 +564,7 @@ def fix_toc(docx) -> int:
                 sec += 1
         else:
             candidates.append((el, None, None, sec))
-    fixed = 0
+    done = []
     for k, (p, m, kind, s) in enumerate(candidates):
         if m is None:
             continue
@@ -574,13 +574,93 @@ def fix_toc(docx) -> int:
             if len(near) < 3:
                 continue
         _replace_leader(p, len(m.group("title")), m.start("page"))
-        ppr = _ppr(p)
-        ind = ppr.find(w("ind"))
-        right = _twips(ind, "right") if ind is not None else 0
+        done.append((k, p, s))
+    for group in _toc_groups(done):
+        s = group[0][2]
         width = widths[min(s, len(widths) - 1)] if widths else 9355
-        _set_tabs(p, [("right", max(0, width - right), "dot")])
-        fixed += 1
-    return fixed
+        right = toc_right_indent([_twips(_ppr(p).find(w("ind")), "right") if _ppr(p).find(w("ind")) is not None
+                                  else 0 for _, p, _ in group], width)
+        labels = _align_toc_labels([p for _, p, _ in group])
+        for _, p, _ in group:
+            stops = [("right", max(0, width - right), "dot")]
+            if p in labels:
+                stops.insert(0, ("left", labels[p], None))
+            if right:
+                _set_ind(p, right=right)
+            _set_tabs(p, stops)
+    return len(done)
+
+
+TOC_LABEL_RE = re.compile(r"^(?P<label>\d{1,3}(?:\.\d{1,3}){0,5}\.?)(?P<gap>[ \u00a0]+)\S")
+
+
+def _toc_groups(done: list) -> list[list]:
+    """Подряд идущие пункты оглавления одного раздела (между ними не больше двух других абзацев)."""
+    groups: list[list] = []
+    for item in done:
+        if groups and item[2] == groups[-1][-1][2] and item[0] - groups[-1][-1][0] <= 3:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups
+
+
+def toc_right_indent(rights: list[int], width: int) -> int:
+    """Общий правый край пунктов оглавления.
+
+    pdf2docx даёт правый отступ только многострочным пунктам (у однострочного он 0), поэтому номера
+    страниц у одних пунктов стояли у края листа, у других — на 2–3 см левее. Край у всего оглавления
+    один — берём наибольший разумный отступ."""
+    usable = [r for r in rights if 0 < r < width * 0.4]
+    return max(usable) if usable else 0
+
+
+def _set_ind(p, **values) -> None:
+    ppr = _ppr(p)
+    ind = ppr.find(w("ind"))
+    if ind is None:
+        ind = etree.Element(w("ind"))
+        _insert(ppr, ind, _PPR_AFTER_TABS[_PPR_AFTER_TABS.index("w:ind") + 1:])
+    for key, val in values.items():
+        if val is None:
+            ind.attrib.pop(w(key), None)
+        else:
+            ind.set(w(key), str(int(val)))
+
+
+def _align_toc_labels(paragraphs: list) -> dict:
+    """«2.3 Отделение …»: номер пункта и текст — как в оглавлении Word, через табуляцию.
+
+    Положение текста берётся у многострочного пункта того же уровня (у него pdf2docx определил
+    выступ первой строки), однострочным пунктам ставится тот же выступ. Возвращает {абзац: позиция
+    табуляции после номера, твипы}."""
+    info = []
+    for p in paragraphs:
+        m = TOC_LABEL_RE.match(_ptext(p))
+        if not m:
+            continue
+        ind = _ppr(p).find(w("ind"))
+        left = _twips(ind, "left") if ind is not None else 0
+        hang = _twips(ind, "hanging") if ind is not None else 0
+        first = _twips(ind, "firstLine") if ind is not None else 0
+        depth = m.group("label").rstrip(".").count(".") + 1
+        info.append((p, m, depth, left - hang + first, left, hang))
+    exemplars: dict[int, tuple[int, int]] = {}
+    for p, m, depth, label_x, left, hang in info:
+        if hang > 0:
+            exemplars.setdefault(depth, (label_x, left))
+    out = {}
+    for p, m, depth, label_x, left, hang in info:
+        if depth not in exemplars:
+            continue
+        ex_label, ex_text = exemplars[depth]
+        if abs(label_x - ex_label) > 60 or ex_text <= ex_label:
+            continue
+        _set_ind(p, left=ex_text, hanging=ex_text - ex_label, firstLine=None)
+        start = len(m.group("label"))
+        _replace_leader(p, start, start + len(m.group("gap")))
+        out[p] = ex_text
+    return out
 
 
 def shrink_section_breaks(body) -> int:
@@ -592,6 +672,7 @@ def shrink_section_breaks(body) -> int:
     """
     n = 0
     children = list(body)
+    page_ends = _page_end_breaks(children)
     for k, el in enumerate(children):
         if el.tag != w("p") or el.find(w("r")) is not None:
             continue
@@ -599,7 +680,9 @@ def shrink_section_breaks(body) -> int:
         breaks = ppr is not None and ppr.find(w("sectPr")) is not None
         last = k + 1 < len(children) and children[k + 1].tag == w("sectPr")
         after_table = k > 0 and children[k - 1].tag == w("tbl")
-        if not (breaks or last) or not (after_table or _is_tiny_neighbour(children, k)):
+        if not (breaks or last):
+            continue
+        if not (after_table or _is_tiny_neighbour(children, k) or k in page_ends or last):
             continue
         ppr = _ppr(el)
         sp = ppr.find(w("spacing"))
@@ -618,6 +701,28 @@ def shrink_section_breaks(body) -> int:
         sz.set(w("val"), "2")
         n += 1
     return n
+
+
+def _page_end_breaks(children) -> set[int]:
+    """Индексы абзацев-разрывов, за которыми следующий раздел начинается с новой страницы.
+
+    Такой абзац — последний на листе, после него ничего не видно; его высота в строку только
+    выталкивает на лишнюю страницу плотно заполненный лист (штамп, нижняя таблица, имя файла).
+    """
+    marks = []
+    for k, el in enumerate(children):
+        if el.tag == w("sectPr"):
+            marks.append((k, el))
+        elif el.tag == w("p"):
+            sp = el.find(f"{w('pPr')}/{w('sectPr')}")
+            if sp is not None:
+                marks.append((k, sp))
+    out = set()
+    for (k, _), (_, nxt) in zip(marks, marks[1:]):
+        kind = nxt.find(w("type"))
+        if kind is None or kind.get(w("val"), "nextPage") != "continuous":
+            out.add(k)
+    return out
 
 
 def _is_tiny_neighbour(children, k: int) -> bool:
@@ -986,3 +1091,29 @@ def improve_structure(docx) -> dict[str, int]:
     res["toc"] = fix_toc(docx)
     res["headings"] = mark_headings(docx)
     return res
+
+
+# --------------------------------------------------------------------------- режим совместимости
+
+WORD_URI = "http://schemas.microsoft.com/office/word"
+
+
+def set_compatibility_mode(docx, mode: int) -> None:
+    """Режим совместимости Word (14 — Word 2010, 15 — Word 2013 и новее).
+
+    В режиме 15 Word (и LibreOffice с 24.2) сжимает пробелы в строках с выравниванием по ширине,
+    как это делал Word, сохранивший исходный PDF, и ставит таблицы по границе, а не по тексту
+    первой ячейки; документ к тому же не открывается «в режиме ограниченной функциональности».
+    """
+    settings = docx.settings.element
+    compat = settings.find(w("compat"))
+    if compat is None:
+        compat = etree.SubElement(settings, w("compat"))
+    for el in compat.findall(w("compatSetting")):
+        if el.get(w("name")) == "compatibilityMode":
+            el.set(w("val"), str(mode))
+            return
+    el = etree.SubElement(compat, w("compatSetting"))
+    el.set(w("name"), "compatibilityMode")
+    el.set(w("uri"), WORD_URI)
+    el.set(w("val"), str(mode))

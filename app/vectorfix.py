@@ -118,7 +118,8 @@ def _install_shading_rows() -> None:
     def lattice_tables(self, connected_border_tolerance, min_border_clearance, max_border_width):
         hidden = []
         try:
-            hidden = _add_shading_rows(self._shapes, Fill, Stroke, RectType)
+            texts = _text_line_boxes(self._blocks)
+            hidden = _add_shading_rows(self._shapes, Fill, Stroke, RectType, texts)
         except Exception:
             log.debug("shading rows skipped", exc_info=True)
         try:
@@ -131,7 +132,42 @@ def _install_shading_rows() -> None:
     TablesConstructor.lattice_tables = lattice_tables
 
 
-def _add_shading_rows(shapes, Fill, Stroke, RectType) -> list:
+def _text_line_boxes(blocks) -> list[tuple]:
+    """Куски текста строк: на этапе поиска таблиц блоки ещё «сырые» строки (Line).
+
+    Строка без вертикалей между словами склеена из соседних граф («Ду215   40   16»), поэтому берутся
+    не строки целиком, а куски без заметных промежутков (geometry.text_chunks)."""
+    lines = []
+    for b in blocks:
+        if type(b).__name__ == "Line":
+            lines.append(b)
+        elif getattr(b, "is_text_block", False):
+            lines.extend(b.lines)
+    out = []
+    for ln in lines:
+        spans = []
+        for sp in getattr(ln, "spans", ()):
+            box = _ink_box(sp)
+            if box is not None:
+                spans.append((box, getattr(sp, "size", 0.0) or (box[3] - box[1])))
+        out.extend(geo.text_chunks(spans) if spans else [tuple(ln.bbox)])
+    return out
+
+
+def _ink_box(span) -> tuple | None:
+    """Рамка фрагмента без пробелов по краям (пробелы-заполнители тянутся до соседней графы)."""
+    chars = [c for c in getattr(span, "chars", ()) if (getattr(c, "c", "") or "").strip()]
+    if chars:
+        return (chars[0].bbox[0], min(c.bbox[1] for c in chars), chars[-1].bbox[2], max(c.bbox[3] for c in chars))
+    if getattr(span, "chars", None):
+        return None                      # одни пробелы
+    text = getattr(span, "text", None)
+    if text is not None and not text.strip():
+        return None
+    return tuple(span.bbox)              # картинка в строке
+
+
+def _add_shading_rows(shapes, Fill, Stroke, RectType, texts=()) -> list:
     strokes = [s for s in shapes if isinstance(s, Stroke)]
     fills = [tuple(s.bbox) for s in shapes if isinstance(s, Fill) and s.has_potential_type(RectType.SHADING)]
     if len(strokes) < 4:
@@ -140,7 +176,7 @@ def _add_shading_rows(shapes, Fill, Stroke, RectType) -> list:
     v = [(s.x0, s.y0, s.y1) for s in strokes if s.vertical]
     hidden = []
     segments = [((x0, y), (x1, y)) for y, x0, x1 in geo.shading_row_borders(fills, h, v)]
-    segments += [((x, y0), (x, y1)) for x, y0, y1 in geo.band_bridges(h, v)]
+    segments += [((x, y0), (x, y1)) for x, y0, y1 in geo.band_bridges(h, v, texts=texts)]
     for start, end in segments:
         stroke = Stroke({"start": start, "end": end, "width": 0.0, "color": 0xFFFFFF})
         stroke._potential_type = RectType.BORDER.value   # не подчёркивание и не зачёркивание

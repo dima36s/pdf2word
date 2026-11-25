@@ -47,8 +47,15 @@ class Band:
 
 # --------------------------------------------------------------------------- разбор областей
 
-def band_pass(fitz_doc, cfg: dict, specs: dict) -> dict:
-    """{номер страницы: (Document, [bbox таблиц верхнего уровня])} для областей из specs."""
+BAND_CHUNK = 12      # листов за один проход pdf2docx: память — на пачку, а не на весь документ
+
+
+def band_pass(fitz_doc, cfg: dict, specs: dict, progress=None) -> dict:
+    """{номер страницы: (Band, [bbox таблиц верхнего уровня])} для областей из specs.
+
+    Листы разбираются пачками по BAND_CHUNK, и от каждого сразу остаётся только готовое
+    содержимое колонтитула (prepare): документ Word на каждый лист 300-страничного тома занимал
+    гигабайты. progress(done, total) — после каждой пачки."""
     from docx import Document
     from pdf2docx.page.Page import Page
     from pdf2docx.page.Pages import Pages
@@ -59,23 +66,38 @@ def band_pass(fitz_doc, cfg: dict, specs: dict) -> dict:
     out: dict = {}
     if not specs:
         return out
-    pages = Pages()
-    pages.reset([Page(id=i, skip_parsing=i not in specs) for i in range(fitz_doc.page_count)])
+    ids = sorted(specs)
     with regions(fitz_doc, specs):
-        pages.parse(fitz_doc, **cfg)
-        for page in pages:
-            if page.skip_parsing:
-                continue
+        for start in range(0, len(ids), BAND_CHUNK):
+            chunk = set(ids[start:start + BAND_CHUNK])
+            pages = Pages()
+            pages.reset([Page(id=i, skip_parsing=i not in chunk) for i in range(fitz_doc.page_count)])
             try:
-                parse_page_safely(page, cfg)
-                d = Document()
-                page.make_docx(d)
-                tables = [tuple(b.bbox) for section in page.sections for column in section
-                          for b in column.blocks if b.is_table_block]
-                out[page.id] = (d, tables)
+                pages.parse(fitz_doc, **cfg)
             except Exception as exc:
-                log.warning("header/footer pass failed on page %s: %s", page.id + 1, exc)
+                log.warning("header/footer pass failed on pages %s: %s", sorted(chunk), exc)
+                continue
+            for page in pages:
+                if page.skip_parsing:
+                    continue
+                try:
+                    parse_page_safely(page, cfg)
+                    d = Document()
+                    page.make_docx(d)
+                    tables = [tuple(b.bbox) for section in page.sections for column in section
+                              for b in column.blocks if b.is_table_block]
+                    out[page.id] = (prepare(d), tables)
+                except Exception as exc:
+                    log.warning("header/footer pass failed on page %s: %s", page.id + 1, exc)
+            if progress:
+                progress(min(start + BAND_CHUNK, len(ids)), len(ids))
     return out
+
+
+def copy_band(band: Band) -> Band:
+    """Своя копия содержимого: одна и та же шапка ставится на много листов, а при вставке её
+    элементы дополняются (боковой штамп, рамка, номер листа)."""
+    return Band([copy.deepcopy(el) for el in band.elements], dict(band.images))
 
 
 # --------------------------------------------------------------------------- подготовка содержимого
@@ -507,7 +529,31 @@ def attach(page_sections: list, contents: dict[int, dict[str, Band]],
             section.header_distance = Pt(max(0.0, dist["header"]))
         if "footer" in dist:
             section.footer_distance = Pt(max(0.0, dist["footer"]))
+        for kind in ("header", "footer"):
+            if prev[kind] is not None and not _canonical(bands.get(kind)):
+                _fit_empty_into_margin(section, kind)
     return made
+
+
+def _fit_empty_into_margin(section, kind: str) -> None:
+    """Пустой колонтитул (лист без шапки среди листов с шапкой) — внутрь поля страницы.
+
+    Даже пустой абзац колонтитула в 1 pt, стоящий ниже поля (расстояние 36 pt при поле 15 pt у
+    листов А3 со штампом), сдвигает текст листа вниз на разницу, и плотно заполненный лист
+    переезжает на следующую страницу.
+    """
+    from docx.shared import Pt
+
+    margin = section.top_margin if kind == "header" else section.bottom_margin
+    dist = section.header_distance if kind == "header" else section.footer_distance
+    if margin is None:
+        return
+    limit = max(0, int(margin) - int(Pt(2)))
+    if dist is None or int(dist) > limit:
+        if kind == "header":
+            section.header_distance = limit
+        else:
+            section.footer_distance = limit
 
 
 def set_start_page(section, number: int) -> None:

@@ -21,7 +21,7 @@ from typing import Callable
 from . import ocr
 from .regionfix import regions
 from .pdftools import (ConversionError, classify_page, editable_copy, find_background_panels, open_pdf,
-                       parse_page_range, remove_background_panels)
+                       parse_page_range, remove_background_panels, squeezes_spaces)
 from .textfix import install_patches, parse_page_safely
 
 log = logging.getLogger(__name__)
@@ -86,6 +86,9 @@ class ConvertStats:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+BODY_CHUNK = 24     # листов за один проход pdf2docx по телу документа
 
 
 class _PageErrorCollector(logging.Handler):
@@ -235,35 +238,45 @@ class Conversion:
         made: list[int] = []
         plan = None
         try:
-            plan = self._plan_furniture(cfg, base)
-            cv.load_pages(pages=self.indices)
-            with regions(self.work, plan.body_specs if plan else {}):
-                cv.parse_document(**cfg)
-
-                to_parse = [p for p in cv.pages if not p.skip_parsing]
-                span = (90 - base) * 0.75
-                for k, page in enumerate(to_parse):
-                    progress(base + span * k / max(len(to_parse), 1), f"Разбираю страницу {page.id + 1}")
-                    try:
-                        parse_page_safely(page, cfg)
-                    except Exception as exc:  # одна страница не должна валить весь документ
-                        log.warning("page %s parse error: %s", page.id + 1, exc)
-                        collector.pages.append(page.id + 1)
-
+            # оформление (шапка, штамп): до 15 % хода; тело — пачками по BODY_CHUNK листов,
+            # чтобы память шла на пачку, а не на весь том (315 листов — 3 ГБ без этого)
+            plan = self._plan_furniture(cfg, base, base + (95 - base) * 0.15)
             from docx import Document
             docx = Document()
-            ready = [p for p in cv.pages if p.finalized]
-            if not ready:
+            start = base + (95 - base) * 0.15
+            targets = list(self.targets)
+            for c0 in range(0, len(targets), BODY_CHUNK):
+                chunk = targets[c0:c0 + BODY_CHUNK]
+                done = start + (95 - start) * c0 / len(targets)
+                step = (95 - start) * len(chunk) / len(targets)
+                progress(done, f"Разбираю страницы {chunk[0] + 1}–{chunk[-1] + 1} из {self.doc.page_count}")
+                cv.load_pages(pages=chunk)
+                with regions(self.work, plan.body_specs if plan else {}):
+                    try:
+                        cv.parse_document(**cfg)
+                    except Exception as exc:  # пачка целиком — по одной странице, чтобы найти виноватую
+                        log.warning("pages %s–%s parse error: %s", chunk[0] + 1, chunk[-1] + 1, exc)
+                        self._parse_one_by_one(cv, chunk, cfg, collector)
+                    to_parse = [p for p in cv.pages if not p.skip_parsing]
+                    for k, page in enumerate(to_parse):
+                        progress(done + step * 0.6 * k / max(len(to_parse), 1), f"Разбираю страницу {page.id + 1}")
+                        try:
+                            parse_page_safely(page, cfg)
+                        except Exception as exc:  # одна страница не должна валить весь документ
+                            log.warning("page %s parse error: %s", page.id + 1, exc)
+                            collector.pages.append(page.id + 1)
+                ready = [p for p in cv.pages if p.finalized]
+                for k, page in enumerate(ready):
+                    progress(done + step * (0.6 + 0.4 * k / len(ready)), f"Собираю Word: страница {page.id + 1}")
+                    try:
+                        page.make_docx(docx)
+                        made.append(page.id)
+                    except Exception as exc:
+                        log.warning("page %s make_docx error: %s", page.id + 1, exc)
+                        collector.pages.append(page.id + 1)
+                cv._pages.reset([])        # разобранная пачка больше не нужна
+            if not made:
                 raise ConversionError("Не удалось разобрать ни одной страницы документа.")
-            start = base + span
-            for k, page in enumerate(ready):
-                progress(start + (95 - start) * k / len(ready), f"Собираю Word: страница {page.id + 1}")
-                try:
-                    page.make_docx(docx)
-                    made.append(page.id)
-                except Exception as exc:
-                    log.warning("page %s make_docx error: %s", page.id + 1, exc)
-                    collector.pages.append(page.id + 1)
         finally:
             logging.getLogger().removeHandler(collector)
 
@@ -273,6 +286,12 @@ class Conversion:
 
         progress(96, "Сохраняю документ")
         _finalize_docx(docx, title=opts.title)
+        try:
+            from .docxfix import set_compatibility_mode
+            # пробелы в строках по ширине Word сжимал → режим Word 2013+, иначе строки длиннее, чем в PDF
+            set_compatibility_mode(docx, 14 if squeezes_spaces(doc, self.targets) is False else 15)
+        except Exception:
+            log.exception("compatibility mode not set")
         try:
             _merge_column_sections(docx)
         except Exception:
@@ -319,7 +338,27 @@ class Conversion:
         return stats
 
     # ------------------------------------------------------------------ колонтитулы
-    def _plan_furniture(self, cfg: dict, base: float) -> "_FurniturePlan | None":
+    @staticmethod
+    def _parse_one_by_one(cv, chunk: list[int], cfg: dict, collector: "_PageErrorCollector") -> None:
+        """Разбор пачки упал на какой-то странице — разбираем по одной; сбойная пропускается
+        (её номер попадёт в предупреждение), остальные переносятся."""
+        from pdf2docx.page.Page import Page
+        from pdf2docx.page.Pages import Pages
+
+        n = cv.fitz_doc.page_count
+        good = {}
+        for i in chunk:
+            one = Pages()
+            one.reset([Page(id=j, skip_parsing=j != i) for j in range(n)])
+            try:
+                one.parse(cv.fitz_doc, **cfg)
+                good[i] = one[i]
+            except Exception as exc:
+                log.warning("page %s raw parse error: %s", i + 1, exc)
+                collector.pages.append(i + 1)
+        cv._pages.reset([good.get(j) or Page(id=j, skip_parsing=True) for j in range(n)])
+
+    def _plan_furniture(self, cfg: dict, base: float, until: float | None = None) -> "_FurniturePlan | None":
         """Шапка, штампы и рамка листа → отдельные проходы pdf2docx для колонтитулов (app/furniture.py)."""
         from . import furniture as fu
         from . import geometry as geo
@@ -365,7 +404,8 @@ class Conversion:
                 return [f.footer] if f.footer else []
             return list(f.sides)
 
-        for kind in ("header", "footer", "side"):
+        until = base if until is None else until
+        for n_kind, kind in enumerate(("header", "footer", "side")):
             specs, alias, seen = {}, {}, {}
             for i, (pe, f) in plan.pages.items():
                 boxes = boxes_of(f, kind)
@@ -381,8 +421,14 @@ class Conversion:
                 # (с ними pdf2docx отбросил бы его как содержимое за полем страницы)
                 specs[i] = Spec(keep=boxes, frame=f.frame, lr_margin=None if kind == "side" else plan.lr[i],
                                 frame_mode="touched" if kind == "footer" else "drop")
+            lo = base + (until - base) * n_kind / 3
+            hi = base + (until - base) * (n_kind + 1) / 3
+
+            def band_progress(done: int, total: int, lo=lo, hi=hi) -> None:
+                self.progress(lo + (hi - lo) * done / max(total, 1), "Переношу шапку и штамп в колонтитулы")
+
             try:
-                res = headers.band_pass(self.work, cfg, specs)
+                res = headers.band_pass(self.work, cfg, specs, band_progress)
             except Exception:
                 log.warning("%s pass failed", kind, exc_info=True)
                 res = {}
@@ -428,12 +474,12 @@ class Conversion:
             _, f = plan.pages[pid]
             c = {}
             if (r := plan.bands["header"].get(pid)) is not None:
-                c["header"] = headers.prepare(r[0])
+                c["header"] = headers.copy_band(r[0])
             side = plan.bands["side"].get(pid)
             if side is not None or f.frame is not None:
                 band = c.get("header") or headers.Band([])
                 if side is not None:
-                    sb = headers.prepare(side[0])
+                    sb = headers.copy_band(side[0])
                     tables = [el for el in sb.elements if el.tag == headers.w("tbl")]
                     for el, bbox in zip(tables, side[1]):
                         band.elements.append(headers.textbox_paragraph([el], bbox))
@@ -442,7 +488,7 @@ class Conversion:
                     band.elements.append(headers.frame_paragraph(f.frame))
                 c["header"] = band
             if (r := plan.bands["footer"].get(pid)) is not None:
-                c["footer"] = headers.prepare(r[0])
+                c["footer"] = headers.copy_band(r[0])
             contents[pid] = c
         first = headers.page_fields(contents)
         n = headers.attach(list(zip(made, page_secs)), contents, plan.distances)

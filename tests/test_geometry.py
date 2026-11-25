@@ -155,3 +155,36 @@ def test_separate_tables_are_not_bridged():
     assert geo.band_bridges([(y, 58, 146) for y in (60, 110, 126, 176)], v) == []
     v = [(x, 60, 110) for x in xs] + [(x, 126, 176) for x in xs]
     assert geo.band_bridges([(y, 58, 319) for y in (60, 110, 176)], v) == []
+
+
+def test_full_width_group_title_is_not_bridged():
+    # «8.1.4. Перегрузочный узел …» по центру через все графы — объединённая ячейка, не делим
+    xs = [58, 146, 319, 383, 468, 546]
+    parts = [(60, 110), (126, 176)]
+    v = [(x, a, b) for a, b in parts for x in xs]
+    h = [(y, 58, 546) for a, b in parts for y in (a, b)]
+    title = [(150.0, 113.0, 420.0, 123.0)]
+    assert geo.band_bridges(h, v, texts=title) == []
+    # подписи групп в своих графах («Ду215», «40», «16») — делим
+    cells = [(180.0, 113.0, 210.0, 123.0), (400.0, 113.0, 412.0, 123.0), (500.0, 113.0, 510.0, 123.0)]
+    assert len(geo.band_bridges(h, v, texts=cells)) == len(xs)
+
+
+def test_group_title_with_values_keeps_value_columns():
+    xs = [58, 146, 319, 383, 468, 546]
+    parts = [(60, 110), (126, 176)]
+    v = [(x, a, b) for a, b in parts for x in xs]
+    h = [(y, 58, 546) for a, b in parts for y in (a, b)]
+    # каталог: «Ду215» по центру своей графы, «40» и «16» — в своих: вся сетка
+    texts = [(216.8, 113.0, 248.8, 123.0), (419.2, 113.0, 431.3, 123.0), (500.8, 113.0, 512.9, 123.0)]
+    assert sorted({round(b[0]) for b in geo.band_bridges(h, v, texts=texts)}) == xs
+    # заголовок через первые графы и значения в своих: первая граница не проводится
+    texts = [(100.0, 113.0, 300.0, 123.0), (420.0, 113.0, 430.0, 123.0), (500.0, 113.0, 510.0, 123.0)]
+    assert sorted({round(b[0]) for b in geo.band_bridges(h, v, texts=texts)}) == [58, 319, 383, 468, 546]
+
+
+def test_text_chunks_split_on_column_gaps():
+    spans = [((216.8, 104, 248.8, 116), 12.0), ((419.2, 104, 431.3, 116), 12.0), ((500.8, 104, 512.9, 116), 12.0)]
+    assert len(geo.text_chunks(spans)) == 3
+    words = [((250, 104, 300, 116), 11.0), ((303, 104, 400, 116), 11.0)]       # «8.1.4.» + « Перегрузочный…»
+    assert geo.text_chunks(words) == [(250, 104, 400, 116)]

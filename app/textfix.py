@@ -105,6 +105,33 @@ def _space_char(after: dict, gap: float, size: float, fill: bool = False) -> dic
             "bbox": (x0, after["bbox"][1], x0 + w, after["bbox"][3]), "synthetic": True}
 
 
+MARKER_TAB_GAP = 2.5      # промежуток после маркера списка больше 2,5 пробела — это табуляция Word
+_SPACE_EM = 0.28          # ширина пробела Arial/Times в долях кегля
+
+
+def _tab_char(after: dict, text_x: float) -> dict:
+    """Синтетическая табуляция от символа after до начала текста text_x (позиция табуляции)."""
+    x0 = after["bbox"][2]
+    return {"c": "\t", "origin": (x0, after["origin"][1]),
+            "bbox": (x0, after["bbox"][1], max(x0 + 0.1, text_x), after["bbox"][3]), "synthetic": True}
+
+
+def marker_gap_is_tab(gap: float, size: float) -> bool:
+    """«−<TAB>текст» в списке Word: от маркера до текста заметно больше обычного пробела."""
+    return gap > MARKER_TAB_GAP * _SPACE_EM * size
+
+
+def _strip_trailing_spaces(line: dict) -> dict | None:
+    """Убрать пробелы в конце строки; вернуть последний оставшийся символ."""
+    for span in reversed(line["spans"]):
+        chars = span.get("chars") or []
+        while chars and chars[-1].get("c", "").isspace():
+            chars.pop()
+        if chars:
+            return chars[-1]
+    return None
+
+
 def _union(a, b):
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
@@ -176,8 +203,20 @@ def _try_merge(a: dict, b: dict, barriers: Barriers = NO_BARRIERS) -> bool:
                                      min(a["bbox"][1], b["bbox"][1]), max(a["bbox"][3], b["bbox"][3])):
         return False      # между фрагментами линия таблицы: это соседние ячейки
     has_space = ca_last["c"].isspace() or cb_first["c"].isspace()
+    marker = _is_list_marker(_line_text(a))
+    if marker and not cb_first["c"].isspace():
+        # «−» и текст пункта — разные строки PDF; промежуток между ними в Word был табуляцией
+        head = _last_char(a) if not ca_last["c"].isspace() else None
+        tail = head or _strip_trailing_spaces(a)
+        if tail is not None and marker_gap_is_tab(b["bbox"][0] - tail["bbox"][2], size) \
+                and b["bbox"][0] - tail["bbox"][2] < 6 * size:
+            last_span = next(sp for sp in reversed(a["spans"]) if sp.get("chars"))
+            last_span["chars"].append(_tab_char(tail, b["bbox"][0]))
+            a["spans"].extend(b["spans"])
+            a["bbox"] = _union(a["bbox"], b["bbox"])
+            return True
     if not has_space:
-        if not (_is_list_marker(_line_text(a)) and gap < 4 * size):
+        if not (marker and gap < 4 * size):
             return False
         a["spans"][-1]["chars"].append(_space_char(ca_last, gap, size, fill=True))
     a["spans"].extend(b["spans"])
@@ -212,6 +251,9 @@ def _insert_missing_spaces(line: dict) -> None:
         gap = c2["bbox"][0] - c1["bbox"][2]
         if gap > 0.2 * size:
             marker = _is_list_marker(head) and gap < 4 * size
+            if marker and marker_gap_is_tab(gap, size):
+                prev["chars"].append(_tab_char(c1, c2["bbox"][0]))
+                continue
             prev["chars"].append(_space_char(c1, gap, size, fill=marker))
 
 
@@ -295,6 +337,14 @@ def install_patches() -> None:
     RawPageFitz._preprocess_text = _preprocess_text
     _patch_paragraph_split()
     try:
+        _patch_marker_tabs()
+    except Exception:
+        log.exception("marker tab patch failed")
+    try:
+        _patch_merged_cell_align()
+    except Exception:
+        log.exception("merged cell alignment patch failed")
+    try:
         _patch_char_scaling()
     except Exception:
         log.exception("char scaling patch failed")
@@ -335,6 +385,156 @@ def _row_starts_list_item(text: str) -> bool:
     return bool(_LIST_MARKER_RE.match(first)) and len(text) > len(first)
 
 
+LIST_PREV_END = (":", ";", ".", "!", "?", ",")
+
+
+_DASHES = set("–—−-")
+
+
+def list_item_follows(prev_text: str, prev_width: float, full_width: float, text: str = "–") -> bool:
+    """Строка с маркером списка в начале — новый пункт списка?
+
+    Точка-маркер «•» или маркер с табуляцией после него (список Word) — всегда новый пункт. Тире
+    бывает и посреди фразы: «…четыре нитки «ленточный сгуститель / – ленточный фильтр-пресс» со
+    всем…», поэтому строка с тире — новый пункт, только если предыдущая строка закончилась (знак
+    препинания в конце или не дошла до правого края)."""
+    t = text.lstrip()
+    if len(t) > 1 and t[1] == "\t":
+        return True
+    if t[:1] not in _DASHES:
+        return True
+    return prev_text.rstrip().endswith(LIST_PREV_END) or prev_width < 0.9 * full_width
+
+
+# строка оглавления: «… название ........ 16» — на ней пункт оглавления заканчивается
+TOC_ENTRY_END_RE = re.compile(r"(?:[.·…]\s*){4,}\d{1,4}\s*$")
+SIZE_JUMP = 0.2
+
+
+def toc_entry_ends(text: str) -> bool:
+    return bool(TOC_ENTRY_END_RE.search(text))
+
+
+def size_jump(prev_size: float, size: float) -> bool:
+    """Кегль соседних строк отличается на 20 % и больше — это разные абзацы (заголовок
+    «Содержание» 15 pt над пунктами 12 pt), а не перенос внутри одного."""
+    return prev_size > 0 and size > 0 and abs(size - prev_size) >= SIZE_JUMP * max(prev_size, size)
+
+
+def _row_size(row) -> float:
+    """Кегль большинства букв строки (картинки и пробелы не считаются)."""
+    weight: dict[float, int] = {}
+    for ln in row:
+        for sp in getattr(ln, "spans", ()):
+            text = getattr(sp, "text", "") or ""
+            size = getattr(sp, "size", 0.0) or 0.0
+            n = len(text.strip())
+            if n and size:
+                key = round(size, 1)
+                weight[key] = weight.get(key, 0) + n
+    return max(weight, key=weight.get) if weight else 0.0
+
+
+def marker_tab_stops(block_x0: float, left_space: float, tab_ends: list[float]) -> list[float]:
+    """Позиции табуляций (pt от поля) для «−<TAB>текст»: там, где текст начинался в PDF."""
+    out: list[float] = []
+    for x in tab_ends:
+        pos = round(left_space + (x - block_x0), 1)
+        if pos > 0 and all(abs(pos - o) > 1.0 for o in out):
+            out.append(pos)
+    return out
+
+
+def _patch_marker_tabs() -> None:
+    """Табуляция после маркера списка доходит до того же места, что в PDF (своя позиция табуляции)."""
+    from docx.shared import Pt
+    from pdf2docx.text.TextBlock import TextBlock
+
+    original = TextBlock.make_docx
+
+    def make_docx(self, p):
+        res = original(self, p)
+        try:
+            ends = [c.bbox[2] for ln in self.lines for sp in getattr(ln, "spans", ())
+                    for c in getattr(sp, "chars", ()) if getattr(c, "c", "") == "\t"]
+            if ends:
+                have = [ts.position.pt for ts in p.paragraph_format.tab_stops]
+                for pos in marker_tab_stops(self.bbox[0], self.left_space, ends):
+                    if all(abs(pos - h) > 1.0 for h in have):
+                        p.paragraph_format.tab_stops.add_tab_stop(Pt(pos))
+        except Exception:
+            log.debug("marker tab stop skipped", exc_info=True)
+        return res
+
+    TextBlock.make_docx = make_docx
+
+
+CENTER_MIN_GAP = 12.0     # pt: меньше — обычные поля ячейки, а не выравнивание по центру
+
+
+def cell_vertical_align(cell_box, content_box) -> str | None:
+    """'center' / 'bottom', если текст объединённой по вертикали ячейки стоит посередине / внизу.
+
+    pdf2docx ставит такой текст отступом перед абзацем (114 pt в «Где проводится: Лаборатория…» на
+    три строки таблицы). Word и LibreOffice отдают этот отступ первой строке объединения — она
+    вырастает, и таблица уходит на следующую страницу. Выравнивание ячейки даёт тот же вид без
+    этого."""
+    top = content_box[1] - cell_box[1]
+    bottom = cell_box[3] - content_box[3]
+    if top < CENTER_MIN_GAP:
+        return None
+    if abs(top - bottom) <= max(6.0, 0.25 * (top + bottom)):
+        return "center"
+    if bottom < 0.25 * top and bottom < CENTER_MIN_GAP:
+        return "bottom"
+    return None
+
+
+def _drop_blank_blocks(cell) -> None:
+    """Абзац из одних пробелов в ячейке (хвосты строк соседней графы с выравниванием по ширине)
+    ничего не несёт, а с огромным правым отступом Word/LibreOffice разбивают его на десяток строк —
+    строка таблицы вырастает, и лист переезжает на следующую страницу."""
+    blocks = list(cell.blocks)
+    keep = [b for b in blocks if not (getattr(b, "is_text_block", False) and not b.text.strip()
+                                      and not any(getattr(sp, "image", None) is not None
+                                                  for ln in b.lines for sp in ln.spans))]
+    if len(keep) != len(blocks):
+        cell.blocks.reset(keep)
+
+
+def _patch_merged_cell_align() -> None:
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    from docx.shared import Pt
+    from pdf2docx.table.Cell import Cell
+
+    original = Cell.make_docx
+    modes = {"center": WD_CELL_VERTICAL_ALIGNMENT.CENTER, "bottom": WD_CELL_VERTICAL_ALIGNMENT.BOTTOM}
+
+    def make_docx(self, table, indexes):
+        try:
+            _drop_blank_blocks(self)
+        except Exception:
+            log.debug("blank cell blocks kept", exc_info=True)
+        original(self, table, indexes)
+        try:
+            if not bool(self) or not self.blocks or self.merged_cells[0] < 2:
+                return
+            boxes = [b.bbox for b in self.blocks]
+            content = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                       max(b[2] for b in boxes), max(b[3] for b in boxes))
+            mode = cell_vertical_align(tuple(self.bbox), content)
+            if mode is None:
+                return
+            docx_cell = table.cell(*indexes)
+            docx_cell.vertical_alignment = modes[mode]
+            if docx_cell.paragraphs:
+                docx_cell.paragraphs[0].paragraph_format.space_before = Pt(0)
+        except Exception:
+            log.debug("merged cell alignment skipped", exc_info=True)
+
+    Cell.make_docx = make_docx
+
+
 def _patch_paragraph_split() -> None:
     """Включает в pdf2docx разбиение абзаца перед пунктом списка (в оригинале отключено: `if 0 and …`)."""
     from pdf2docx.common import constants
@@ -354,28 +554,32 @@ def _patch_paragraph_split() -> None:
         punc = tuple(constants.SENTENCE_END_PUNC)
         start_of_para = end_of_para = False
         start_of_sen = end_of_sen = False
+        prev_w, prev_text, prev_size = 0.0, "", 0.0
         for i, row in enumerate(rows):
             end_of_sen = row[-1].text.strip().endswith(punc)
             w = row[-1].bbox[2] - row[0].bbox[0]
-            if i > 0 and _row_starts_list_item("".join(ln.text for ln in row)):
+            text = "".join(ln.text for ln in row)
+            size = _row_size(row)
+            if i > 0 and size_jump(prev_size, size):
+                start_of_para = True
+            elif i > 0 and _row_starts_list_item(text) and list_item_follows(prev_text, prev_w, W, text):
                 start_of_para = True
             elif end_of_sen and w / W <= 1.0 - line_break_free_space_ratio:
                 end_of_para = True
             elif start_of_sen and (W - w) / H >= new_paragraph_free_space_ratio:
                 start_of_para = True
-            if end_of_para:
-                lines.extend(row)
+            if toc_entry_ends(text):
+                end_of_para = True
+            if start_of_para and lines:
                 res.append(lines)
                 lines = Lines()
-            elif start_of_para:
-                if lines:
-                    res.append(lines)
+            lines.extend(row)
+            if end_of_para:
+                res.append(lines)
                 lines = Lines()
-                lines.extend(row)
-            else:
-                lines.extend(row)
             start_of_sen = end_of_sen
             start_of_para = end_of_para = False
+            prev_w, prev_text, prev_size = w, text, size
         if lines:
             res.append(lines)
         return res

@@ -1,6 +1,7 @@
 """Тесты ядра конвертации. Запуск: pytest -q tests/test_core.py"""
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 
@@ -95,6 +96,17 @@ def test_cells_split_by_table_line_are_not_merged():
     assert len(normalize_text_blocks([block], Barriers([(80.0, 20, 60)]))[0]["lines"]) == 1
 
 
+def test_dash_inside_sentence_is_not_list_item():
+    from app.textfix import list_item_follows
+
+    # перенос внутри фразы: строка выше дошла до правого края и не кончилась знаком
+    assert not list_item_follows("включает в себя четыре нитки «ленточный сгуститель", 485.0, 486.0)
+    # настоящие пункты: перед ними двоеточие, точка с запятой или короткая строка
+    assert list_item_follows("состоит из следующих узлов:", 485.0, 486.0)
+    assert list_item_follows("– насос подачи;", 120.0, 486.0)
+    assert list_item_follows("– насос подачи", 120.0, 486.0)
+
+
 def test_list_marker_joined_with_space():
     block = {"type": 0, "lines": [_line("1.", 0), _line("Анализ", 18)]}
     out = normalize_text_blocks([block])
@@ -148,9 +160,11 @@ def test_report(tmp_path):
     d = Document(out)
     assert d.core_properties.title == "Отчёт"
     text = _text(out)
-    for needle in ("Отчёт о пилотном проекте", "• Сократить время", "1. Анализ текущего процесса",
+    for needle in ("Отчёт о пилотном проекте", "•\tСократить время", "1. Анализ текущего процесса",
                    "Удовлетворённость пользователей", "Жирный фрагмент"):
-        assert needle in text
+        assert needle in text           # после маркера списка — табуляция, как в Word
+    doc_xml = zipfile.ZipFile(out).read("word/document.xml").decode()
+    assert re.search(r'<w:tabs><w:tab w:pos="\d+" w:val="left"/></w:tabs>', doc_xml)   # позиция табуляции
     xml = zipfile.ZipFile(out).read("word/document.xml").decode()
     assert "Times New Roman" in xml and "Liberation Serif" not in xml
     assert 'w:hRule="exact"' not in xml.split("<w:trHeight")[1] if "<w:trHeight" in xml else True
@@ -288,3 +302,62 @@ def test_scan_without_ocr_keeps_image(tmp_path):
     out = tmp_path / "n.docx"
     st = convert_pdf(_need("scan.pdf"), out, ConvertOptions(ocr="off"))
     assert st.ocr_pages == 0 and st.images >= 2 and st.warnings
+
+
+def test_toc_entry_ends_paragraph_and_size_jump():
+    from app.textfix import size_jump, toc_entry_ends
+    assert toc_entry_ends("обогащение в главный корпус второй очереди ................ 16 ")
+    assert toc_entry_ends("3.7 Сжатый воздух ....................................... 53")
+    assert not toc_entry_ends("Характеристика принятой технологической схемы производства в целом ")
+    assert not toc_entry_ends("в 2024 г. было принято 16")
+    assert size_jump(15.0, 12.0)          # «Содержание» 15 pt над пунктами 12 pt
+    assert not size_jump(12.0, 11.6)      # «°С» в строке — тот же абзац
+    assert not size_jump(0.0, 12.0)       # строка из картинки
+
+
+def test_list_marker_gap_becomes_tab():
+    from app.textfix import _try_merge, marker_gap_is_tab, marker_tab_stops
+
+    def ch(c, x0, x1, y=100.0):
+        return {"c": c, "origin": (x0, y), "bbox": (x0, y - 10, x1, y + 2)}
+
+    def line(chars, size=12.0):
+        return {"dir": (1, 0), "wmode": 0, "bbox": (chars[0]["bbox"][0], 90, chars[-1]["bbox"][2], 102),
+                "spans": [{"size": size, "chars": chars, "bbox": (chars[0]["bbox"][0], 90, chars[-1]["bbox"][2], 102)}]}
+
+    # «−» и пробел (Symbol), текст пункта — отдельная строка PDF на 18 pt правее: табуляция Word
+    a = line([ch("−", 106.3, 112.9), ch(" ", 112.9, 116.3)])
+    b = line([ch("к", 134.8, 141.0), ch("о", 141.0, 147.7)])
+    assert _try_merge(a, b)
+    text = "".join(c["c"] for s in a["spans"] for c in s["chars"])
+    assert text == "−\tко"
+    tab = next(c for s in a["spans"] for c in s["chars"] if c["c"] == "\t")
+    assert tab["bbox"][2] == 134.8
+    # обычный пробел после тире — не табуляция
+    assert not marker_gap_is_tab(3.4, 12.0) and marker_gap_is_tab(21.9, 12.0)
+    assert marker_tab_stops(70.9, 0.7, [134.8, 134.9]) == [64.6]
+
+
+def test_squeezed_spaces_detected():
+    from app.pdftools import space_ratios
+
+    def ch(c, x0, w):
+        return {"c": c, "origin": (x0, 0), "bbox": (x0, 0, x0 + w, 10)}
+
+    # пробел 3.34 pt, а следующая буква через 2.7 pt — Word сжал пробел
+    chars = []
+    x = 0.0
+    for _ in range(6):
+        chars += [ch("а", x, 6.7), ch(" ", x + 6.7, 3.34)]
+        x += 6.7 + 2.7
+    chars.append(ch("б", x, 6.9))
+    ratios = space_ratios(chars)
+    assert len(ratios) == 6 and all(0.79 < r < 0.82 for r in ratios)
+
+
+def test_merged_cell_vertical_align():
+    from app.textfix import cell_vertical_align
+    # «Лаборатория в пристройке АБК 8.1» посередине трёх строк таблицы
+    assert cell_vertical_align((730, 239, 790, 507), (732, 353, 788, 392)) == "center"
+    assert cell_vertical_align((730, 239, 790, 507), (732, 460, 788, 500)) == "bottom"
+    assert cell_vertical_align((730, 239, 790, 507), (732, 242, 788, 280)) is None     # сверху — как есть

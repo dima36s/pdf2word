@@ -57,8 +57,11 @@ def test_rect_components_match_fitz(seed):
     rects, keys = [], []
     for _ in range(rng.randint(1, 150)):
         x, y = rng.uniform(0, 300), rng.uniform(0, 300)
-        if rng.random() < 0.5:   # тонкие «линии» сетки, как рамки ячеек в каталогах
+        roll = rng.random()
+        if roll < 0.4:   # тонкие «линии» сетки, как рамки ячеек в каталогах
             w, h = (rng.uniform(5, 80), 0.5) if rng.random() < 0.5 else (0.5, rng.uniform(5, 80))
+        elif roll < 0.55:   # вырожденные: нулевая толщина (pdf2docx на них делил на ноль)
+            w, h = (rng.uniform(5, 80), 0.0) if rng.random() < 0.5 else (0.0, rng.uniform(5, 80))
         else:
             w, h = rng.uniform(1, 40), rng.uniform(1, 40)
         rects.append((x, y, x + w, y + h))
@@ -138,3 +141,19 @@ def test_overlap_pairs_match_fitz(seed):
               if not (pymupdf.Rect(rects[i]) & pymupdf.Rect(rects[j])).is_empty]
     assert sorted(speedups.overlap_pairs(rects)) == expect
 
+
+
+def test_hairline_shapes_do_not_crash_merge():
+    """Линии тоньше 0,05 pt: рамка группы округляется до нулевой площади, и pdf2docx делил на
+    ноль — разбор всего документа падал (текстовая часть E110-0038, 315 листов)."""
+    from pdf2docx.shape.Shape import Fill
+    from pdf2docx.shape.Shapes import Shapes
+
+    from app.textfix import install_patches
+
+    install_patches()
+    shapes = [Fill({"bbox": (10, 10.01, 50, 10.04), "color": 0}),
+              Fill({"bbox": (50, 10.01, 90, 10.04), "color": 0}),
+              Fill({"bbox": (10, 20, 10, 60), "color": 0})]          # нулевая ширина
+    merged = Shapes._merge_shapes(shapes)
+    assert len(merged) == 3

@@ -228,3 +228,56 @@ def remove_background_panels(page: pymupdf.Page, panels: list[pymupdf.Rect] | No
                           graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
                           text=pymupdf.PDF_REDACT_TEXT_NONE)
     return len(panels)
+
+
+# --------------------------------------------------------------------------- выравнивание по ширине
+
+SHRINK_RATIO = 0.97       # пробел уже 97 % своей ширины — Word сжал его, чтобы слово вошло в строку
+EXPAND_RATIO = 1.03
+MIN_GAPS = 5              # строки с меньшим числом пробелов ни о чём не говорят
+
+
+def space_ratios(chars) -> list[float]:
+    """Отношение промежутка «пробел → следующая буква» к ширине пробела по шрифту."""
+    out = []
+    for a, b in zip(chars, chars[1:]):
+        if a.get("c") == " " and b.get("c", "").strip():
+            natural = a["bbox"][2] - a["bbox"][0]
+            if natural > 0.5:
+                out.append((b["origin"][0] - a["origin"][0]) / natural)
+    return out
+
+
+def squeezes_spaces(doc: pymupdf.Document, pages=None, max_pages: int = 60, enough: int = 2) -> bool | None:
+    """Сжимал ли Word пробелы в строках с выравниванием по ширине (Word 2013 и новее так делает).
+
+    Тогда документ Word должен быть в режиме Word 2013+ (compatibilityMode 15): в режиме Word 2010
+    пробелы не сжимаются, строки абзацев становятся длиннее, и плотные листы переезжают на
+    следующую страницу. True — сжатые строки есть; False — растянутых строк много, сжатых нет
+    (документ из старого Word или другой программы); None — по тексту не понять.
+    """
+    import statistics
+
+    shrunk = expanded = 0
+    for i in list(pages if pages is not None else range(doc.page_count))[:max_pages]:
+        try:
+            blocks = doc[i].get_text("rawdict", flags=0)["blocks"]
+        except Exception:
+            continue
+        for b in blocks:
+            for line in b.get("lines", ()):
+                if tuple(line.get("dir", (1, 0))) != (1.0, 0.0):
+                    continue
+                ratios = space_ratios([c for s in line["spans"] for c in s.get("chars", ())])
+                if len(ratios) < MIN_GAPS:
+                    continue
+                med = statistics.median(ratios)
+                if 0.6 < med < SHRINK_RATIO:
+                    shrunk += 1
+                    if shrunk >= enough:
+                        return True
+                elif med > EXPAND_RATIO:
+                    expanded += 1
+    if shrunk:
+        return True
+    return False if expanded >= 20 else None

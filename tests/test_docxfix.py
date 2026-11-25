@@ -169,3 +169,51 @@ def test_table_grid_ignores_placeholder_spans():
         t.cell(r, 2).width = 270 * 635
     docxfix.fix_table_grid(t._tbl)
     assert [int(g.get(qn("w:w"))) for g in t._tbl.iter(qn("w:gridCol"))] == [160, 140, 270]
+
+
+def test_page_end_section_break_is_shrunk():
+    from docx.enum.section import WD_SECTION
+    d = Document()
+    d.add_paragraph("лист 1, имя файла внизу")
+    d.add_section(WD_SECTION.NEW_PAGE)
+    d.add_paragraph("лист 2")
+    d.add_section(WD_SECTION.CONTINUOUS)
+    d.add_paragraph("колонки")
+    body = d.element.body
+    breaks = [p for p in body if p.tag.endswith("}p") and p.find(f"{docxfix.w('pPr')}/{docxfix.w('sectPr')}") is not None]
+    assert len(breaks) == 2
+    docxfix.shrink_section_breaks(body)
+    def line(p):
+        sp = p.find(f"{docxfix.w('pPr')}/{docxfix.w('spacing')}")
+        return None if sp is None else sp.get(docxfix.w("line"))
+    assert line(breaks[0]) == "20"          # дальше новый лист — абзац-разрыв в 1 pt
+    assert line(breaks[1]) is None          # дальше раздел на том же листе — не трогаем
+
+
+def test_toc_common_right_edge_and_label_tabs():
+    d = Document()
+    for text, left, hang, right in (("2.1 Общая характеристика схемы ........ 14", 1148, 566, 1584),
+                                    ("2.3 Отделение удаления отходов ........ 39", 582, 0, 0),
+                                    ("3.1 Потребность в сырье ........ 43", 582, 0, 0)):
+        p = d.add_paragraph(text)
+        p.paragraph_format.left_indent = Pt(left / 20)
+        p.paragraph_format.right_indent = Pt(right / 20)
+        if hang:
+            p.paragraph_format.first_line_indent = Pt(-hang / 20)
+    assert docxfix.fix_toc(d) == 3
+    for p in d.paragraphs:
+        ind = p._p.find(f"{docxfix.w('pPr')}/{docxfix.w('ind')}")
+        tabs = [(t.get(docxfix.w("val")), t.get(docxfix.w("pos"))) for t in p._p.iter(docxfix.w("tab"))
+                if t.get(docxfix.w("pos"))]
+        assert ind.get(docxfix.w("right")) == "1584"                 # у всех один правый край
+        assert ind.get(docxfix.w("left")) == "1148" and ind.get(docxfix.w("hanging")) == "566"
+        assert ("left", "1148") in tabs and tabs[-1][0] == "right"
+        assert "\t" in docxfix._ptext(p._p).split(" ", 1)[0]          # «2.3<TAB>Отделение»
+
+
+def test_compatibility_mode():
+    d = Document()
+    docxfix.set_compatibility_mode(d, 15)
+    vals = [el.get(docxfix.w("val")) for el in d.settings.element.iter(docxfix.w("compatSetting"))
+            if el.get(docxfix.w("name")) == "compatibilityMode"]
+    assert vals == ["15"]

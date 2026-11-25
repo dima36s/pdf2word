@@ -65,14 +65,17 @@ def interval_components(intervals: list[tuple[float, float] | None],
 
 def rect_graph(rects: list[tuple[float, float, float, float]], keys: list,
                dist: float) -> list[set[int]]:
-    """Списки смежности: одинаковый ключ и a ∩ (b, расширенный на dist) ≠ ∅.
+    """Списки смежности: одинаковый ключ и a ∩ (b, расширенный на dist) ≠ ∅, где a — элемент
+    с меньшим номером (так вызывает Collection.group).
 
-    Строгие неравенства — как fitz.Rect.intersects; прямоугольники должны быть непустыми.
+    Как fitz.Rect.intersects: строгие неравенства, пустой (вырожденный) a не пересекается ни с чем.
     Соседи добавляются по возрастанию — как в Collection.group, поэтому graph_bfs pdf2docx
     обходит граф в том же порядке, и порядок элементов в группах совпадает с исходным.
     """
     n = len(rects)
     neighbours: list[list[int]] = [[] for _ in range(n)]
+    empty = [not (r[0] < r[2] and r[1] < r[3]) for r in rects]
+    grown_empty = [not (r[2] - r[0] + 2 * dist > 0 and r[3] - r[1] + 2 * dist > 0) for r in rects]
     by_key: dict = {}
     for i, k in enumerate(keys):
         by_key.setdefault(k, []).append(i)
@@ -87,7 +90,10 @@ def rect_graph(rects: list[tuple[float, float, float, float]], keys: list,
                 if a1 + dist <= x0:        # дальше по x уже не дотянется ни до кого
                     continue
                 keep.append(i)
-                if b0 < y1 + dist and y0 - dist < b1:
+                lo, hi = (i, j) if i < j else (j, i)
+                if empty[lo] or grown_empty[hi]:
+                    continue
+                if a0 < x1 + dist and b0 < y1 + dist and y0 - dist < b1:
                     neighbours[i].append(j)
                     neighbours[j].append(i)
             keep.append(j)
@@ -141,7 +147,28 @@ def install() -> None:
     _patch_docx_cells()
     _patch_overlapped_lines()
     _patch_cell_assignment()
+    _patch_fonts_cache()
     _installed = True
+
+
+def _patch_fonts_cache() -> None:
+    """Fonts.extract читает шрифты всего документа; разбор идёт пачками листов и отдельными
+    проходами для колонтитулов — шрифты берутся один раз на документ."""
+    from pdf2docx.font.Fonts import Fonts
+
+    original = Fonts.extract.__func__
+
+    def extract(cls, fitz_doc):
+        try:
+            cache = fitz_doc.__dict__.setdefault("_p2w_fonts", {})
+        except (AttributeError, TypeError):
+            return original(cls, fitz_doc)
+        key = fitz_doc.page_count
+        if key not in cache:
+            cache[key] = original(cls, fitz_doc)
+        return cache[key]
+
+    Fonts.extract = classmethod(extract)
 
 
 def _box(rect) -> tuple[float, float, float, float]:
@@ -278,10 +305,9 @@ def _patch_merge_shapes() -> None:
             rects = []
             for s in normal:
                 b = s.bbox
-                r = (float(b.x0), float(b.y0), float(b.x1), float(b.y1))
-                if not (r[0] < r[2] and r[1] < r[3]) or b.is_infinite:
+                if b.is_infinite:
                     return original(shapes)
-                rects.append(r)
+                rects.append((float(b.x0), float(b.y0), float(b.x1), float(b.y1)))
             comps = rect_components(rects, [s.color for s in normal], constants.TINY_DIST)
         except Exception:
             log.debug("fast shape merge failed", exc_info=True)
@@ -291,6 +317,8 @@ def _patch_merge_shapes() -> None:
             group = Collection([normal[i] for i in comp])
             merged_area = group.bbox.get_area()
             sum_area = sum(shape.bbox.get_area() for shape in group)
+            # нулевая площадь (линии тоньше 0,05 pt: рамка группы округляется до 0,1) — pdf2docx
+            # здесь делил на ноль и ронял разбор всего документа; такие фигуры не склеиваем
             if merged_area and sum_area / merged_area >= constants.FACTOR_ALMOST:
                 merged.append(group[0].update_bbox(group.bbox))
             else:
