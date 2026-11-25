@@ -211,6 +211,26 @@ def test_toc_common_right_edge_and_label_tabs():
         assert "\t" in docxfix._ptext(p._p).split(" ", 1)[0]          # «2.3<TAB>Отделение»
 
 
+def test_toc_keeps_tab_after_picture_number():
+    # «[картинка «1»]⇥Предисловие ........ 10»: левая табуляция pdf2docx (до текста пункта) остаётся,
+    # иначе табуляция после номера уходила к номеру страницы и отточие вставало перед текстом.
+    # Левая табуляция у номера страницы (графа без отточия) — не остаётся: там нужно отточие
+    from docx.shared import Pt as _Pt
+    d = Document()
+    for text in ("\tПредисловие ........ 10", "\tОбозначения ........ 8", "\tТермины ........ 9"):
+        p = d.add_paragraph(text)
+        p.paragraph_format.tab_stops.add_tab_stop(_Pt(29))
+    for text in ("Общие положения ........ 4", "Основная часть ........ 5", "Заключение ........ 9"):
+        p = d.add_paragraph(text)
+        p.paragraph_format.tab_stops.add_tab_stop(_Pt(400))
+    assert docxfix.fix_toc(d) == 6
+    def stops(p):
+        return [(t.get(docxfix.w("val")), t.get(docxfix.w("pos"))) for t in p._p.iter(docxfix.w("tab"))
+                if t.get(docxfix.w("pos"))]
+    assert stops(d.paragraphs[0])[0] == ("left", "580") and stops(d.paragraphs[0])[-1][0] == "right"
+    assert [v for v, _ in stops(d.paragraphs[3])] == ["right"]
+
+
 def test_compatibility_mode():
     d = Document()
     docxfix.set_compatibility_mode(d, 15)

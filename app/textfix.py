@@ -186,7 +186,60 @@ def page_barriers(page) -> Barriers:
     return Barriers(out)
 
 
-def _try_merge(a: dict, b: dict, barriers: Barriers = NO_BARRIERS) -> bool:
+COLUMN_GAP_EM = 3.0       # кеглей: уже — пробел между словами (и растянутый пробел строки по ширине)
+COLUMN_GAP_WIDE = 8.0     # кеглей: шире — разрыв колонок и без выравнивания с соседними строками
+COLUMN_ALIGN_TOL = 2.0    # pt: правая часть начинается там же, где строки выше или ниже
+COLUMN_ALIGN_DY = 6.0     # кеглей: насколько далеко по вертикали ищем такие строки
+
+
+def line_starts(blocks: list[dict]) -> list[tuple[float, float, float]]:
+    """(x начала, x конца без пробелов, базовая линия) каждой горизонтальной строки листа."""
+    out = []
+    for block in blocks:
+        for ln in block.get("lines") or ():
+            if not _horizontal(ln):
+                continue
+            ink = [c for c in _chars(ln) if not c.get("c", "").isspace()]
+            if ink:
+                out.append((ink[0]["bbox"][0], ink[-1]["bbox"][2], ink[0]["origin"][1]))
+    return out
+
+
+def _column_gap(a: dict, b: dict, size: float, starts=()) -> bool:
+    """Между строками a и b одного ряда — разрыв колонок: подпись слева и значение справа
+    («Градостроительный план подготовлен     Заместителем начальника…»), «М.П.  (подпись)  (расшифровка)».
+
+    Склеенные в одну строку, они теряют место: pdf2docx ставит правую колонку сразу за левой, и
+    строки двух колонок перемешиваются. Раздельные строки ряда pdf2docx сам расставляет по табуляциям.
+    Разрыв колонок — шире трёх кеглей (и трёх пробелов строки: у строки по ширине они растянуты), и
+    либо правая часть начинается там же, где строки выше или ниже (колонка), либо разрыв больше
+    восьми кеглей. Строка, что кончается у общего правого края с соседними, — строка по ширине
+    с растянутыми пробелами: её склеиваем, как раньше."""
+    if _is_list_marker(_line_text(a)):
+        return False                     # «−»/«1)» и текст пункта: промежуток — табуляция списка
+    ca, cb = list(_chars(a)), list(_chars(b))
+    while ca and ca[-1].get("c", "").isspace():
+        ca = ca[:-1]
+    right = next((c for c in cb if not c.get("c", "").isspace()), None)
+    if not ca or right is None:
+        return False
+    gap = right["bbox"][0] - ca[-1]["bbox"][2]
+    spaces = sorted(c["bbox"][2] - c["bbox"][0] for c in ca if c.get("c") == " ")
+    space = spaces[len(spaces) // 2] if spaces else 0.3 * size
+    if gap <= COLUMN_GAP_EM * max(size, space):
+        return False
+    bx, by = right["bbox"][0], right["origin"][1]
+    near = [(x0, x1) for x0, x1, y in starts if 0.5 * size < abs(y - by) <= COLUMN_ALIGN_DY * size]
+    ink_b = [c for c in cb if not c.get("c", "").isspace()]
+    bend = ink_b[-1]["bbox"][2]
+    if sum(1 for _, x1 in near if abs(x1 - bend) <= 1.0) >= 2:
+        return False                     # строка по ширине: кончается у края, как соседние строки
+    if gap > COLUMN_GAP_WIDE * size:
+        return True
+    return any(abs(x0 - bx) <= COLUMN_ALIGN_TOL for x0, _ in near)
+
+
+def _try_merge(a: dict, b: dict, barriers: Barriers = NO_BARRIERS, starts=()) -> bool:
     """Склеить строку b в конец строки a, если это продолжение той же строки текста."""
     if not (_horizontal(a) and _horizontal(b)):
         return False
@@ -197,7 +250,7 @@ def _try_merge(a: dict, b: dict, barriers: Barriers = NO_BARRIERS) -> bool:
     if abs(ca_last["origin"][1] - cb_first["origin"][1]) > 0.2 * size:
         return False
     gap = b["bbox"][0] - a["bbox"][2]
-    if gap < -0.5 or gap > 15 * size:
+    if gap < -0.5 or gap > 15 * size or _column_gap(a, b, size, starts):
         return False
     if barriers and barriers.between(a["bbox"][2] - 0.5, b["bbox"][0] + 0.5,
                                      min(a["bbox"][1], b["bbox"][1]), max(a["bbox"][3], b["bbox"][3])):
@@ -247,6 +300,8 @@ def _insert_missing_spaces(line: dict) -> None:
         c1, c2 = prev["chars"][-1], nxt["chars"][0]
         if c1["c"].isspace() or c2["c"].isspace():
             continue
+        if c2["c"] in _CLOSING or c1["c"] in _OPENING:
+            continue          # «Пример», (текст), «объекта,» — пробел перед закрывающим знаком не нужен
         size = max(prev.get("size", 10), nxt.get("size", 10))
         gap = c2["bbox"][0] - c1["bbox"][2]
         if gap > 0.2 * size:
@@ -258,6 +313,8 @@ def _insert_missing_spaces(line: dict) -> None:
 
 
 _NO_SPACE_AFTER = set("-\u00ad\u2010\u2011/")   # дефисы: перенос слова, пробел не нужен
+_CLOSING = set("»)]},.;:!?%”’")
+_OPENING = set("«([{„“‘")
 _NEVER_WORD_START = set("ьъы")                 # с этих букв не начинается ни одно слово
 
 
@@ -282,7 +339,120 @@ def _add_line_end_space(line: dict, nxt: dict) -> None:
     line["spans"][-1]["chars"].append(_space_char(last, size * 0.25, size))
 
 
+FRAGMENT_MAX = 3          # символов: запятая, точка, пробел, кавычка из шрифта-заменителя
+FRAGMENT_NUM_MAX = 12     # цифры и знаки («2.1.1 », «(12)») — номер пункта в шрифте-заменителе
+
+
+def _fragment_like(chars: list[dict]) -> bool:
+    """Обрывок строки из шрифта-заменителя: до 3 видимых знаков или до 12 цифр/знаков без букв."""
+    visible = [c["c"] for c in chars if not c["c"].isspace()]
+    if len(chars) > 2 * FRAGMENT_NUM_MAX:
+        return False
+    if len(visible) <= FRAGMENT_MAX:
+        return True
+    return len(visible) <= FRAGMENT_NUM_MAX and not any(ch.isalpha() for ch in visible)
+
+
+def _line_chars(line: dict) -> list[dict]:
+    return [c for sp in line.get("spans", ()) for c in sp.get("chars", ())]
+
+
+def _line_size(line: dict) -> float:
+    return max((sp.get("size", 0.0) for sp in line.get("spans", ())), default=0.0)
+
+
+def _find_host(frag: dict, hosts: list[dict]) -> dict | None:
+    chars = _line_chars(frag)
+    if not chars or frag.get("dir", (1, 0)) != (1, 0) and tuple(frag.get("dir", (1, 0))) != (1.0, 0.0):
+        return None
+    fy = chars[0]["origin"][1]
+    fx0, fx1 = frag["bbox"][0], frag["bbox"][2]
+    best, best_dy = None, None
+    for h in hosts:
+        hc = _line_chars(h)
+        if not hc or tuple(h.get("dir", (1, 0))) != tuple(frag.get("dir", (1, 0))):
+            continue
+        size = max(_line_size(h), 1.0)
+        dy = abs(hc[0]["origin"][1] - fy)
+        if dy > 0.2 * size:
+            continue
+        if fx1 < h["bbox"][0] - 0.3 * size or fx0 > h["bbox"][2] + 0.3 * size:
+            continue
+        if best is None or dy < best_dy:
+            best, best_dy = h, dy
+    return best
+
+
+def _span_bbox(chars: list[dict]) -> tuple:
+    return (min(c["bbox"][0] for c in chars), min(c["bbox"][1] for c in chars),
+            max(c["bbox"][2] for c in chars), max(c["bbox"][3] for c in chars))
+
+
+def _insert_fragment(host: dict, frag: dict) -> None:
+    """Вставить знаки фрагмента в строку, каждый на своё место по x и со своим шрифтом.
+
+    Пробел строки на месте вставляемого знака — заполнитель (LibreOffice рисует «, » поверх него),
+    он убирается. Фрагмент «  (» в «Приложение А (обязательное)» лежит по обе стороны от «А»."""
+    seq = [(c, sp) for sp in host["spans"] for c in (sp.get("chars") or [])]
+    for fsp in frag["spans"]:
+        for fc in fsp.get("chars") or []:
+            f0, f1 = fc["bbox"][0], fc["bbox"][2]
+            fw = max(f1 - f0, 0.01)
+
+            def covered(c):
+                w = c["bbox"][2] - c["bbox"][0]
+                ov = min(c["bbox"][2], f1) - max(c["bbox"][0], f0)
+                return c["c"].isspace() and w > 0 and ov > 0.5 * min(w, fw)
+
+            if fc["c"].isspace() and any(not c["c"].isspace() and min(c["bbox"][2], f1) - max(c["bbox"][0], f0)
+                                         > 0.5 * fw for c, _ in seq):
+                continue                      # пробел поверх буквы строки — лишний
+            seq = [(c, sp) for c, sp in seq if not covered(c)]
+            fx = (f0 + f1) / 2
+            k = next((i for i, (c, _) in enumerate(seq) if (c["bbox"][0] + c["bbox"][2]) / 2 > fx), len(seq))
+            seq.insert(k, (fc, fsp))
+    spans: list[dict] = []
+    group: list[dict] = []
+    owner = None
+    for c, sp in seq:
+        if owner is not None and sp is not owner:
+            spans.append(dict(owner, chars=group, bbox=_span_bbox(group)))
+            group = []
+        owner = sp
+        group.append(c)
+    if group:
+        spans.append(dict(owner, chars=group, bbox=_span_bbox(group)))
+    host["spans"] = spans + [sp for sp in host["spans"] if not sp.get("chars")]
+    host["bbox"] = _union(host["bbox"], frag["bbox"])
+
+
+def embed_fragments(lines: list[dict]) -> list[dict]:
+    """Знаки из шрифта-заменителя — обратно в свою строку.
+
+    Если в шрифте нет кириллицы (Cambria/Calibri без замены в LibreOffice), буквы набираются одним
+    шрифтом, а запятые, точки и пробелы — другим, и PyMuPDF отдаёт каждую запятую отдельной
+    «строкой» внутри основной. pdf2docx удалял такие строки как перекрытые: из текста пропадали
+    все знаки препинания, строки становились короче, абзацы переносились иначе и листы переезжали.
+    """
+    hosts = [ln for ln in lines if not _fragment_like(_line_chars(ln))]
+    if not hosts:
+        return lines
+    out = []
+    for ln in lines:
+        chars = _line_chars(ln)
+        if not chars or not _fragment_like(chars):
+            out.append(ln)
+            continue
+        host = _find_host(ln, hosts)
+        if host is None:
+            out.append(ln)
+            continue
+        _insert_fragment(host, ln)
+    return out
+
+
 def normalize_text_blocks(blocks: list[dict], barriers: Barriers = NO_BARRIERS) -> list[dict]:
+    starts = line_starts(blocks)
     for block in blocks:
         lines = block.get("lines")
         if not lines:
@@ -290,9 +460,10 @@ def normalize_text_blocks(blocks: list[dict], barriers: Barriers = NO_BARRIERS) 
         for line in lines:
             for span in line["spans"]:
                 _fix_symbol_chars(span)
+        lines = embed_fragments(lines)
         merged = [lines[0]]
         for ln in lines[1:]:
-            if not _try_merge(merged[-1], ln, barriers):
+            if not _try_merge(merged[-1], ln, barriers, starts):
                 merged.append(ln)
         for ln in merged:
             _absorb_blank_spans(ln)
@@ -352,6 +523,14 @@ def install_patches() -> None:
         _patch_two_line_indent()
     except Exception:
         log.exception("two-line indent patch failed")
+    try:
+        _patch_ragged_right()
+    except Exception:
+        log.exception("ragged right patch failed")
+    try:
+        _patch_tab_stop_rounding()
+    except Exception:
+        log.exception("tab stop patch failed")
     try:
         from . import vectorfix
         vectorfix.install()
@@ -419,6 +598,30 @@ def size_jump(prev_size: float, size: float) -> bool:
     """Кегль соседних строк отличается на 20 % и больше — это разные абзацы (заголовок
     «Содержание» 15 pt над пунктами 12 pt), а не перенос внутри одного."""
     return prev_size > 0 and size > 0 and abs(size - prev_size) >= SIZE_JUMP * max(prev_size, size)
+
+
+def row_centered(left: float, right: float, width: float, line_h: float) -> bool:
+    """Строка по центру блока: отступы слева и справа заметные и почти равные."""
+    if width <= 0:
+        return False
+    return left > 0.12 * width and right > 0.12 * width and abs(left - right) < 0.08 * width + line_h
+
+
+def _span_bold(sp) -> bool:
+    font = (getattr(sp, "font", "") or "").lower()
+    return bool(getattr(sp, "flags", 0) & 16) or "bold" in font or "black" in font or "heavy" in font
+
+
+def _row_bold(row) -> bool:
+    """Вся строка жирная (по числу букв в жирных фрагментах)."""
+    total = bold = 0
+    for ln in row:
+        for sp in getattr(ln, "spans", ()):
+            n = len((getattr(sp, "text", "") or "").strip())
+            total += n
+            if n and _span_bold(sp):
+                bold += n
+    return total > 0 and bold >= 0.9 * total
 
 
 def _row_size(row) -> float:
@@ -555,13 +758,24 @@ def _patch_paragraph_split() -> None:
         start_of_para = end_of_para = False
         start_of_sen = end_of_sen = False
         prev_w, prev_text, prev_size = 0.0, "", 0.0
+        prev_bold, prev_centered, prev_x0 = False, False, 0.0
+        bx0 = min(row[0].bbox[0] for row in rows)
+        bx1 = max(row[-1].bbox[2] for row in rows)
         for i, row in enumerate(rows):
             end_of_sen = row[-1].text.strip().endswith(punc)
             w = row[-1].bbox[2] - row[0].bbox[0]
             text = "".join(ln.text for ln in row)
             size = _row_size(row)
+            bold = _row_bold(row)
+            centered = row_centered(row[0].bbox[0] - bx0, bx1 - row[-1].bbox[2], bx1 - bx0, H)
             if i > 0 and size_jump(prev_size, size):
                 start_of_para = True
+            elif i > 0 and prev_bold and not bold and prev_w < 0.85 * max(W, bx1 - bx0):
+                start_of_para = True      # короткий жирный заголовок «Площадь земельного участка», под ним текст
+            elif i > 0 and centered != prev_centered:
+                start_of_para = True      # значение поля по центру под строкой с левого края — свой абзац
+            elif i > 0 and row[0].bbox[0] - prev_x0 > max(4 * H, 0.25 * (bx1 - bx0)):
+                start_of_para = True      # строка начинается намного правее предыдущей — не продолжение абзаца
             elif i > 0 and _row_starts_list_item(text) and list_item_follows(prev_text, prev_w, W, text):
                 start_of_para = True
             elif end_of_sen and w / W <= 1.0 - line_break_free_space_ratio:
@@ -580,6 +794,7 @@ def _patch_paragraph_split() -> None:
             start_of_sen = end_of_sen
             start_of_para = end_of_para = False
             prev_w, prev_text, prev_size = w, text, size
+            prev_bold, prev_centered, prev_x0 = bold, centered, row[0].bbox[0]
         if lines:
             res.append(lines)
         return res
@@ -838,6 +1053,121 @@ def two_line_indent(x0_first: float, x0_second: float, x1_first: float, x1_block
     return indent, x1_first >= x1_block - max(right_threshold, 1.0)
 
 
+def ragged_right_space(rows: list[tuple[float, float, float | None, float]], column_right: float,
+                       current: float, column_edge: float | None = None) -> float:
+    """Правый отступ абзаца с выравниванием влево по переносам его строк.
+
+    rows: (x0, x1, ширина первого слова, ширина пробела[, высота строки]) по физическим строкам
+    абзаца. pdf2docx ставит отступ от конца самой длинной строки — абзац становится уже, чем был,
+    и в Word каждая строка переносится раньше. Строка перенесена, потому что первое слово следующей
+    не вошло: правый край абзаца — до «конец строки + пробел + слово». column_edge — край колонки
+    по всем абзацам листа: если переносы абзаца не доказывают, что он уже колонки (граница дальше
+    края колонки), абзац шёл во всю ширину колонки и берёт её край."""
+    if len(rows) < 2:
+        return current
+    from .regionfix import flush_right, slack_edge
+    longest = max(r[1] for r in rows)
+    bounds = [a[1] + b[3] + b[2] for a, b in zip(rows, rows[1:])
+              if b[2] is not None and abs(b[0] - rows[1][0]) <= 2.0]
+    bounds = [b for b in bounds if b > longest + 0.3]
+    bound = min(bounds) if bounds else None
+    heights = sorted(r[4] for r in rows if len(r) > 4 and r[4])
+    flush = flush_right([r[1] for r in rows])
+    edge = slack_edge(longest, bound, heights[len(heights) // 2] if heights else None, flush)
+    if column_edge is not None:
+        if not flush and (bound is None or bound > column_edge + 0.5):
+            edge = max(column_edge, longest + 0.3)           # во всю ширину колонки
+        else:
+            edge = min(edge, max(column_edge, longest + 0.3))
+    return max(0.0, min(current, round(column_right - edge, 1)))
+
+
+def _patch_ragged_right() -> None:
+    from pdf2docx.common.share import TextAlignment
+    from pdf2docx.text.TextBlock import TextBlock
+
+    from .regionfix import _first_word_width, _row_text, _space_width
+
+    from pdf2docx.layout.Blocks import Blocks
+
+    from .regionfix import right_edge_from_breaks
+
+    original_blocks = Blocks._parse_block_horizontal_spacing
+
+    def _parse_block_horizontal_spacing(self, *args):
+        in_cell = type(getattr(self, "parent", None)).__name__ == "Cell"
+        for b in self._instances:
+            b._p2w_in_cell = in_cell     # в ячейке край задают граница и поля ячейки — не трогаем
+        try:
+            rows = []
+            for b in self._instances:
+                if getattr(b, "is_text_block", False) and b.is_horizontal_text:
+                    for ln in b.lines:
+                        rows.append((ln.bbox[0], ln.bbox[1], ln.bbox[2], ln.bbox[3],
+                                     _first_word_width(ln), _space_width(ln), _row_text(ln)))
+            edge = right_edge_from_breaks(rows)
+            for b in self._instances:
+                b._p2w_column_edge = edge
+        except Exception:
+            log.debug("column edge skipped", exc_info=True)
+        return original_blocks(self, *args)
+
+    Blocks._parse_block_horizontal_spacing = _parse_block_horizontal_spacing
+
+    original = TextBlock.parse_horizontal_spacing
+
+    def parse_horizontal_spacing(self, bbox, *args, **kwargs):
+        res = original(self, bbox, *args, **kwargs)
+        try:
+            if self.alignment != TextAlignment.LEFT or self.right_space <= 0 or getattr(self, "_p2w_in_cell", True):
+                return res
+            if not self.is_horizontal_text:
+                return res
+            rows = self.lines.group_by_physical_rows()
+            if len(rows) < 2:
+                return res
+            data = [(r[0].bbox[0], r[-1].bbox[2], _first_word_width(r[0]), _space_width(r[0]),
+                     max(ln.bbox[3] for ln in r) - min(ln.bbox[1] for ln in r)) for r in rows]
+            self.right_space = ragged_right_space(data, bbox[2], self.right_space,
+                                                  getattr(self, "_p2w_column_edge", None))
+        except Exception:
+            log.debug("ragged right skipped", exc_info=True)
+        return res
+
+    TextBlock.parse_horizontal_spacing = parse_horizontal_spacing
+
+
+HANG_LABEL_SHARE = 0.35    # номер — не шире трети строки
+HANG_ALIGN_TOL = 1.5       # pt
+
+
+def hanging_label(rows: list[list[tuple[float, float]]], x0: float, x1: float, gap: float,
+                  right_tol: float = 1.0):
+    """Пункт «номер ⇥ текст» с выступом: в первой строке номер и после промежутка текст, следующие
+    строки начинаются там же, где текст («2⇥Характеристика принятой… / производства в целом…»).
+
+    pdf2docx ставит такие строки табуляциями: продолжения начинались с табуляции, а в оглавлении
+    она уходила к номеру страницы — отточие перед текстом. Это абзац с выступом, как в Word.
+    rows — (x0, x1) строк по рядам. Возвращает (x номера, x текста, индекс строки текста в первом
+    ряду, ряды до последнего во всю ширину) или None."""
+    if len(rows) < 2 or len(rows[0]) < 2:
+        return None
+    first = rows[0]
+    k = next((i for i in range(1, len(first)) if first[i][0] - first[i - 1][1] >= gap), None)
+    if k is None:
+        return None
+    x_a, x_b = first[0][0], first[k][0]
+    if x_b - x_a > HANG_LABEL_SHARE * (x1 - x0) or x_b - x_a <= gap:
+        return None
+    if any(abs(r[0][0] - x_b) > HANG_ALIGN_TOL for r in rows[1:]):
+        return None
+    if any(r[i][0] - r[i - 1][1] >= gap for r in rows[1:] for i in range(1, len(r))):
+        return None                      # в продолжениях свои колонки — это не абзац
+    ends = [r[-1][1] for r in rows[:-1]]
+    full = len(ends) >= 2 and max(ends) - min(ends) <= right_tol     # по ширине — как решает pdf2docx
+    return x_a, x_b, k, full
+
+
 def _patch_two_line_indent() -> None:
     from pdf2docx.common.share import TextAlignment
     from pdf2docx.text.TextBlock import TextBlock
@@ -854,6 +1184,20 @@ def _patch_two_line_indent() -> None:
             if res != TextAlignment.NONE or f != 1:
                 return res
             rows = self.lines.group_by_physical_rows()
+            found = hanging_label([[(ln.bbox[0], ln.bbox[2]) for ln in r] for r in rows],
+                                  self.bbox[0], self.bbox[2], line_separate_threshold,
+                                  lines_right_aligned_threshold)
+            if found is not None:
+                x_a, x_b, k, full = found
+                # left_space — начало первой строки (номера); при выступе pdf2docx сам сдвигает отступ
+                self.left_space += x_a - self.bbox[0]
+                self.first_line_space = -(x_b - x_a)
+                for i, ln in enumerate(rows[0]):
+                    ln.tab_stop = 1 if i == k else 0
+                for r in rows[1:]:
+                    for ln in r:
+                        ln.tab_stop = 0
+                return TextAlignment.JUSTIFY if full else TextAlignment.LEFT
             if len(rows) != 2 or any(len(r) != 1 for r in rows):
                 return res
             found = two_line_indent(rows[0][0].bbox[idx0], rows[1][0].bbox[idx0], rows[0][-1].bbox[idx1],
@@ -868,3 +1212,49 @@ def _patch_two_line_indent() -> None:
             return res
 
     TextBlock._parse_alignment = _parse_alignment
+
+
+# --------------------------------------------------------------------------- табуляции в строке
+
+TAB_STOP_EPS = 0.06       # pt: позиции табуляций pdf2docx округляет до 0,1
+
+
+def tab_index(pos: float, origin: float, stops: list[float]) -> int:
+    """Сколько позиций табуляции стоит не правее pos (позиции — от левого края блока)."""
+    pos -= origin
+    i = 0
+    for t in stops:
+        if pos < t - TAB_STOP_EPS:
+            break
+        i += 1
+    return i
+
+
+def _patch_tab_stop_rounding() -> None:
+    """Строка, начинающаяся ровно на позиции табуляции, теряла табуляцию.
+
+    pdf2docx округляет позиции табуляций до 0,1 pt, а начало строки сравнивает с ними без
+    округления: 426,2 − 91,4 = 334,7999… < 334,8 — строка считается левее своей позиции, и
+    «(подпись)  (расшифровка подписи)» слипались. Сравниваем с допуском на округление."""
+    from pdf2docx.common import constants
+    from pdf2docx.text.Lines import Lines
+
+    def parse_tab_stop(self, line_separate_threshold: float):
+        block = self.parent
+        idx0, idx1 = (0, 2) if block.is_horizontal_text else (3, 1)
+        stops = sorted({p for p in (round(abs(ln.bbox[idx0] - block.bbox[idx0]), 1) for ln in self._instances)
+                        if p >= constants.MINOR_DIST})
+        block.tab_stops = stops
+        if not stops:
+            return
+        origin = block.bbox[idx0]
+        ref = origin
+        lines = self._instances
+        for i, line in enumerate(lines):
+            if line.bbox[idx0] - ref > line_separate_threshold:
+                line.tab_stop = tab_index(line.bbox[idx0], origin, stops) - tab_index(ref, origin, stops)
+            if i == len(lines) - 1:
+                break
+            ref = line.bbox[idx1] if line.in_same_row(lines[i + 1]) else origin
+
+    Lines.parse_tab_stop = parse_tab_stop

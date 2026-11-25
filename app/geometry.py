@@ -337,3 +337,96 @@ def split_points(inner: Sequence[float], texts: Sequence[Box], tol: float = 1.0)
         if any(t[2] <= x + tol for t in texts) and any(t[0] >= x - tol for t in texts):
             out.append(x)
     return out
+
+
+# --------------------------------------------------------------------------- стыки линий САПР
+
+JOINT_MIN = 2.0      # pt: pdf2docx отбрасывает фигуры, у которых обе стороны меньше этого
+JOINT_TOL = 0.3      # pt
+
+
+def bridge_joints(boxes: Sequence[Box], colors: Sequence, min_dim: float = JOINT_MIN,
+                  tol: float = JOINT_TOL) -> list[Box]:
+    """Квадратики на стыках линий (САПР рисует линию сетки кусками от стыка до стыка, а стык —
+    отдельным квадратиком 1,5×1,5 pt) растягиваются вдоль линии до min_dim.
+
+    pdf2docx выбрасывает фигуры меньше 2 pt, и линия рвётся на каждом стыке: таблица делится на
+    куски, а текст ячейки, что пересекает разрыв («Подпись и дата» бокового штампа рядом с основным
+    штампом), выпадает из таблицы горизонтальной строкой."""
+    out = [tuple(b) for b in boxes]
+    vert: dict[int, list[int]] = {}
+    horz: dict[int, list[int]] = {}
+    for i, b in enumerate(out):
+        w, h = b[2] - b[0], b[3] - b[1]
+        if h >= min_dim and w < min_dim:
+            vert.setdefault(round(b[0] * 2), []).append(i)
+        elif w >= min_dim and h < min_dim:
+            horz.setdefault(round(b[1] * 2), []).append(i)
+
+    def neighbours(index, key):
+        for k in (key - 1, key, key + 1):
+            yield from index.get(k, ())
+
+    for i, b in enumerate(out):
+        w, h = b[2] - b[0], b[3] - b[1]
+        if max(w, h) >= min_dim:
+            continue
+        grow = None
+        for j in neighbours(vert, round(b[0] * 2)):
+            o = out[j]
+            if colors[j] == colors[i] and abs(o[0] - b[0]) <= tol and abs(o[2] - b[2]) <= tol \
+                    and (abs(o[3] - b[1]) <= tol or abs(o[1] - b[3]) <= tol):
+                grow = "v"
+                break
+        if grow is None:
+            for j in neighbours(horz, round(b[1] * 2)):
+                o = out[j]
+                if colors[j] == colors[i] and abs(o[1] - b[1]) <= tol and abs(o[3] - b[3]) <= tol \
+                        and (abs(o[2] - b[0]) <= tol or abs(o[0] - b[2]) <= tol):
+                    grow = "h"
+                    break
+        half = min_dim / 2 + 0.05
+        if grow == "v":
+            c = (b[1] + b[3]) / 2
+            out[i] = (b[0], c - half, b[2], c + half)
+        elif grow == "h":
+            c = (b[0] + b[2]) / 2
+            out[i] = (c - half, b[1], c + half, b[3])
+    return out
+
+
+def merge_collinear(boxes: Sequence[Box], colors: Sequence, thin: float = 3.0,
+                    tol: float = JOINT_TOL) -> list[list[int]]:
+    """Группы индексов тонких заливок одного цвета, что лежат на одной прямой встык (кусок —
+    стык — кусок). Каждую группу можно заменить одной линией.
+
+    Линии сетки из САПР нарисованы кусками от стыка до стыка. pdf2docx склеивает куски, только
+    если вся связная сетка — одна сплошная заливка, иначе оставляет их порознь, и таблица рвётся
+    на стыках: боковой штамп рядом с основным делился на обрывки, «Подпись и дата» выпадала из
+    клетки горизонтальной строкой."""
+    groups: list[list[int]] = []
+    for axis in ("v", "h"):
+        lo, hi, a0, a1 = (1, 3, 0, 2) if axis == "v" else (0, 2, 1, 3)
+        items = []
+        for i, b in enumerate(boxes):
+            w, h = b[2] - b[0], b[3] - b[1]
+            if (axis == "v" and w <= thin and h >= w) or (axis == "h" and h <= thin and w > h):
+                items.append(i)
+        items.sort(key=lambda i: (round(boxes[i][a0], 1), boxes[i][lo]))
+        cur: list[int] = []
+        for i in items:
+            b = boxes[i]
+            if cur:
+                last = boxes[cur[-1]]
+                end = max(boxes[k][hi] for k in cur)
+                if colors[i] == colors[cur[-1]] and abs(b[a0] - last[a0]) <= tol \
+                        and abs(b[a1] - last[a1]) <= tol and b[lo] <= end + tol:
+                    cur.append(i)
+                    continue
+                if len(cur) > 1:
+                    groups.append(cur)
+            cur = [i]
+        if len(cur) > 1:
+            groups.append(cur)
+    return groups
+

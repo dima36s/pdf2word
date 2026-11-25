@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import hashlib
 import io
 import logging
@@ -208,6 +209,7 @@ def _layout_table(chunks: list[list], widths: list[int]):
                 sp.set(w("after"), "0")
         if tc[-1].tag != w("p"):
             etree.SubElement(tc, w("p"))     # ячейка Word кончается абзацем
+    _rule_to_table_bottom(tbl, pr)
     if gap <= 20:
         return [tbl]
     spacer = etree.Element(w("p"))
@@ -215,6 +217,50 @@ def _layout_table(chunks: list[list], widths: list[int]):
     etree.SubElement(ppr, w("spacing"), {w("before"): str(gap - 20), w("after"): "0", w("line"): "20",
                                          w("lineRule"): "exact"})
     return [tbl, spacer]
+
+
+def _rule_to_table_bottom(tbl, tblpr) -> None:
+    """Линия под шапкой «логотип | шифр» на всю ширину — нижняя граница каждой колонки
+    (vectorfix._attach_orphan_rules); в таблице это одна нижняя граница таблицы, иначе линия
+    рвётся на куски по ширине абзацев."""
+    cells = [tc for tc in tbl.iter(w("tc")) if _has_content(list(tc))]
+    if len(cells) < 2:
+        return
+    found = []
+    for tc in cells:
+        paras = [p for p in tc if p.tag == w("p") and _has_content([p])]
+        bottom = paras[-1].find(f"{w('pPr')}/{w('pBdr')}/{w('bottom')}") if paras else None
+        if bottom is None:
+            return
+        found.append(bottom)
+    borders = tblpr.find(w("tblBorders"))
+    if borders is None:
+        return
+    old = borders.find(w("bottom"))
+    new = etree.Element(w("bottom"), {k: v for k, v in found[0].attrib.items()})
+    new.set(w("space"), "0")
+    if old is not None:
+        borders.replace(old, new)
+    else:
+        borders.append(new)
+    try:
+        space = min(float(b.get(w("space"), "0")) for b in found)     # pt: от низа блока до линии
+    except ValueError:
+        space = 0.0
+    if space >= 1.0:
+        mar = tblpr.find(w("tblCellMar"))
+        if mar is not None:          # порядок по схеме: top, left, bottom, right
+            el = etree.Element(w("bottom"), {w("w"): str(int(space * 20)), w("type"): "dxa"})
+            right = mar.find(w("right"))
+            if right is not None:
+                right.addprevious(el)
+            else:
+                mar.append(el)
+    for bottom in found:
+        pbdr = bottom.getparent()
+        pbdr.remove(bottom)
+        if len(pbdr) == 0:
+            pbdr.getparent().remove(pbdr)
 
 
 def _columns_as_tables(elements: list) -> list:
@@ -409,12 +455,60 @@ def frame_paragraph(frame, width: float = 1.0):
 
 # --------------------------------------------------------------------------- номер листа
 
+_NUMBER_IN_TEXT = re.compile(r"\d{1,4}")
+PAGE_TEXT_MAX = 40       # символов: «- 1/9 -», «Страница 3 из 9», «Лист 2» — короткие
+
+
 def _digit_runs(elements):
+    """(число, w:t, (начало, конец)) для чисел колонтитула: целиком в w:t («3») или внутри короткой
+    надписи («- 1/9 -», «Страница 3 из 9»)."""
     for el in elements:
         for t in el.iter(w("t")):
-            text = (t.text or "").strip()
-            if text.isdigit() and len(text) <= 4 and t.getparent() is not None and t.getparent().tag == w("r"):
-                yield int(text), t
+            raw = t.text or ""
+            if t.getparent() is None or t.getparent().tag != w("r"):
+                continue
+            text = raw.strip()
+            if text.isdigit() and len(text) <= 4:
+                start = raw.index(text)
+                # « 1 » — пробелы вокруг номера остаются текстом, иначе поле съест их
+                yield int(text), t, (None if raw == text else (start, start + len(text)))
+            elif len(text) <= PAGE_TEXT_MAX and sum(c.isalpha() for c in text) <= 12:
+                for m in _NUMBER_IN_TEXT.finditer(raw):
+                    yield int(m.group()), t, (m.start(), m.end())
+
+
+def _split_run(t, span: tuple[int, int]):
+    """Разрезать w:r на «до числа», «число», «после» (новые w:r — с тем же оформлением);
+    вернуть w:t с числом."""
+    xml_space = "{http://www.w3.org/XML/1998/namespace}space"
+    run = t.getparent()
+    raw = t.text or ""
+    a, b = span
+    before, num, after = raw[:a], raw[a:b], raw[b:]
+
+    def clone(text: str):
+        r = etree.Element(w("r"))
+        rpr = run.find(w("rPr"))
+        if rpr is not None:
+            r.append(copy.deepcopy(rpr))
+        tt = etree.SubElement(r, w("t"))
+        tt.text = text
+        tt.set(xml_space, "preserve")
+        return r, tt
+
+    if before:
+        t.text = before
+        t.set(xml_space, "preserve")
+        num_run, num_t = clone(num)
+        run.addnext(num_run)
+        anchor = num_run
+    else:
+        t.text = num
+        num_t, anchor = t, run
+    if after:
+        tail, _ = clone(after)
+        anchor.addnext(tail)
+    return num_t
 
 
 def page_fields(contents: dict[int, dict[str, Band]]) -> int | None:
@@ -430,7 +524,7 @@ def page_fields(contents: dict[int, dict[str, Band]]) -> int | None:
             band = contents[pid].get(kind)
             if band is None:
                 continue
-            for n, _ in _digit_runs(band.elements):
+            for n, _, _ in _digit_runs(band.elements):
                 seen.add(n - (pid + 1))
         for k in seen:
             votes[k] = votes.get(k, 0) + 1
@@ -446,8 +540,12 @@ def page_fields(contents: dict[int, dict[str, Band]]) -> int | None:
             band = contents[pid].get(kind)
             if band is None or done:
                 continue
-            for n, t in _digit_runs(band.elements):
+            for n, t, span in list(_digit_runs(band.elements)):
                 if n == target:
+                    if span is not None:
+                        t = _split_run(t, span)
+                        if t is None:
+                            continue
                     run = t.getparent()
                     fld = etree.Element(w("fldSimple"))
                     fld.set(w("instr"), " PAGE ")

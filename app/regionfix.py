@@ -272,6 +272,14 @@ def filter_shapes(page_engine, shapes: list, images: list) -> tuple[list, list]:
         ends = [(s, e) for s, e, _ in lines]
         lines += [item for item in frame_lines if _touched(item[0], item[1], ends)]
     out = [sh for _, _, sh in lines] + out
+    if spec.keep is not None:
+        # штамп и боковой штамп: линии сетки из САПР — кусками от стыка до стыка; в теле листа
+        # не трогаем — там длинная склеенная линия может связать таблицу с рамкой
+        try:
+            from .vectorfix import _join_cad_lines
+            out = _join_cad_lines(out)
+        except Exception:
+            log.debug("joint bridging failed", exc_info=True)
     images = [im for im in images if allowed(spec, *_center(im.get("bbox", (0, 0, 0, 0))))]
     return out, images
 
@@ -297,6 +305,133 @@ def adjust_margin(raw_page, margin: tuple) -> tuple:
     if spec.bottom_limit is not None and v1 > v0:
         bottom = max(0.0, min(max(bottom, height - spec.bottom_limit), height - v1 - 0.5))
     return round(left, 1), round(right, 1), round(top, 1), round(bottom, 1)
+
+
+EDGE_SLACK = 3.0          # pt: запас справа от самой длинной строки
+
+
+def _text_lines(raw_page):
+    for b in raw_page.blocks:
+        if getattr(b, "is_text_block", False):
+            yield from b.lines
+        elif type(b).__name__ == "Line":
+            yield b
+
+
+def _row_text(line) -> str:
+    return "".join(getattr(c, "c", "") or "" for sp in getattr(line, "spans", ()) for c in getattr(sp, "chars", ())).strip()
+
+
+def _first_word_width(line) -> float | None:
+    chars = [c for sp in getattr(line, "spans", ()) for c in getattr(sp, "chars", ())]
+    if not chars:
+        return None
+    end = None
+    for c in chars:
+        if (getattr(c, "c", "") or " ").isspace():
+            if end is not None:
+                break
+            continue
+        end = c.bbox[2]
+    return None if end is None else end - chars[0].bbox[0]
+
+
+def _space_width(line) -> float:
+    """Ширина пробела в строке: по самим пробелам (на краю строки бывают шире — их не берём),
+    иначе 0,32 кегля (Times, Arial, DejaVu — 0,25…0,32)."""
+    chars = [c for sp in getattr(line, "spans", ()) for c in getattr(sp, "chars", ())]
+    widths = sorted(c.bbox[2] - c.bbox[0] for c in chars[1:-1] if (getattr(c, "c", "") or "") == " ")
+    if widths:
+        return widths[len(widths) // 2]
+    sizes = [getattr(sp, "size", 0.0) or 0.0 for sp in getattr(line, "spans", ())]
+    return 0.32 * max(sizes, default=0.0)
+
+
+def right_edge_from_breaks(lines: list[tuple]) -> float | None:
+    """Правый край набора по переносам строк: (x0, y0, x1, y1, ширина первого слова, ширина пробела
+    [, текст строки]).
+
+    Текст с выравниванием влево до края не доходит, и поле по самой длинной строке получается
+    шире настоящего: в Word строки переносятся раньше, каждый абзац длиннее на строку, листы
+    переезжают (7 страниц → 11). Строка перенесена, потому что первое слово следующей не вошло:
+    край левее «конец строки + пробел + это слово». Берём самую тесную такую границу, но не левее
+    самой длинной строки."""
+    if len(lines) < 4:
+        return None
+    longest = max(ln[2] for ln in lines)
+    bounds = []
+    ordered = sorted(lines, key=lambda ln: (ln[1], ln[0]))
+    for a, b in zip(ordered, ordered[1:]):
+        h = a[3] - a[1]
+        if h <= 0 or not (0 <= b[1] - a[3] <= 0.8 * h) or abs(b[0] - a[0]) > 2.0 or b[4] is None:
+            continue                 # следующая строка — не продолжение того же абзаца
+        bound = a[2] + b[5] + b[4]
+        if bound > longest + 0.5:
+            bounds.append(bound)
+    if len(bounds) < 3:
+        return None
+    heights = sorted(ln[3] - ln[1] for ln in lines)
+    flush = flush_right([ln[2] for ln in lines]) or hard_edge(lines, longest)
+    return slack_edge(longest, min(bounds), heights[len(heights) // 2], flush)
+
+
+HARD_EDGE_TOL = 0.6       # pt
+HARD_EDGE_LINES = 3
+
+
+def hard_edge(lines, longest: float) -> bool:
+    """На листе есть строки по ширине (или по правому краю): несколько разных строк кончаются
+    ровно у самой длинной. Край набора тогда известен точно, и расширять его до границы по переносам
+    нельзя — абзацы, что pdf2docx счёл выровненными влево, станут шире исходных. Одинаковые строки
+    (повторённый текст) считаем за одну."""
+    texts = {ln[6] for ln in lines if len(ln) > 6 and longest - ln[2] <= HARD_EDGE_TOL}
+    return len(texts) >= HARD_EDGE_LINES
+
+
+def flush_right(ends: list[float]) -> bool:
+    """Строки кончаются на одном месте (по правому краю, по ширине): край — сама эта точка.
+    У текста с переносом влево строки обрываются где придётся, совпадают лишь изредка."""
+    longest = max(ends, default=0.0)
+    near = sum(1 for e in ends if longest - e <= 1.0)
+    return near >= 2 and 2 * near >= len(ends)
+
+
+BREAK_SAFETY = 2.0        # pt: отступ от границы по переносам, когда берём её
+NARROW_WINDOW = 1.5       # высоты строки: окно «самая длинная строка … граница» узкое
+
+
+def slack_edge(longest: float, bound: float | None, line_height: float | None = None,
+               flush: bool = False) -> float:
+    """Край набора: настоящий край лежит между самой длинной строкой и границей по переносам.
+
+    Край ровно по самой длинной строке не оставляет запаса: Word и LibreOffice меряют строку иначе
+    (пробелы из запасного шрифта в PDF уже, чем в шрифте абзаца, — строка в Word длиннее на пункты),
+    и строки переносились раньше: абзац длиннее, листы переезжают. Если окно узкое (до полутора
+    строк), берём его верх — граница почти точная и ошибиться можно лишь на ширину окна. Если широкое,
+    граница ничего не говорит (у абзаца свой правый отступ) — самая длинная строка + 3 pt. Строки,
+    сведённые к одному краю (flush), край и задают — верх окна там подтянул бы слово со следующей
+    строки. Дальше границы нельзя: туда войдёт слово, которое в PDF не вошло."""
+    if bound is None:
+        return longest + EDGE_SLACK
+    if line_height and not flush and bound - longest <= NARROW_WINDOW * line_height:
+        edge = bound - BREAK_SAFETY
+    else:
+        edge = min(longest + EDGE_SLACK, bound - 0.5)
+    return max(longest + 0.3, edge)
+
+
+def widen_ragged_right(raw_page, margin: tuple) -> tuple:
+    left, right, top, bottom = margin
+    width = raw_page.width
+    rows = []
+    for ln in _text_lines(raw_page):
+        x0, y0, x1, y1 = ln.bbox
+        rows.append((x0, y0, x1, y1, _first_word_width(ln), _space_width(ln), _row_text(ln)))
+    edge = right_edge_from_breaks(rows)
+    if edge is None:
+        return margin
+    new_right = max(0.0, round(width - edge, 1))
+    return (left, min(right, new_right), top, bottom)
 
 
 _installed = False
@@ -331,10 +466,14 @@ def install() -> None:
     def calculate_margin(self, **settings):
         margin = original_margin(self, **settings)
         try:
-            return adjust_margin(self, margin)
+            margin = adjust_margin(self, margin)
         except Exception:
             log.debug("margin adjust failed", exc_info=True)
-            return margin
+        try:
+            margin = widen_ragged_right(self, margin)
+        except Exception:
+            log.debug("ragged right margin skipped", exc_info=True)
+        return margin
 
     RawPageFitz._preprocess_images = _preprocess_images
     RawPage.calculate_margin = calculate_margin

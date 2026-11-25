@@ -101,6 +101,26 @@ def install() -> None:
     _installed = True
 
 
+def _join_cad_lines(shapes: list) -> list:
+    """Линии сетки, нарисованные кусками от стыка до стыка (САПР), — одной заливкой каждая."""
+    fills = [s for s in shapes if "bbox" in s]
+    if len(fills) < 2:
+        return shapes
+    colors = [s.get("color") for s in fills]
+    boxes = geo.bridge_joints([tuple(s["bbox"]) for s in fills], colors)
+    for s, box in zip(fills, boxes):
+        s["bbox"] = list(box)
+    drop = set()
+    for group in geo.merge_collinear(boxes, colors):
+        head = fills[group[0]]
+        bb = boxes[group[0]]
+        for k in group[1:]:
+            bb = geo.union(bb, boxes[k])
+            drop.add(id(fills[k]))
+        head["bbox"] = list(bb)
+    return [s for s in shapes if id(s) not in drop] if drop else shapes
+
+
 # --------------------------------------------------------------------------- «полосатые» таблицы
 
 def _install_shading_rows() -> None:
@@ -190,6 +210,7 @@ def _add_shading_rows(shapes, Fill, Stroke, RectType, texts=()) -> list:
 
 MIN_RULE_LEN = 40.0       # pt: короче — не разделительная линия
 MAX_RULE_GAP = 30.0       # pt: дальше от текста линию к абзацу не привязываем (предел Word — 31 pt)
+TABLE_EDGE_TOL = 3.0      # pt: линия в пределах таблицы с таким допуском — её граница
 
 
 def _install_rules() -> None:
@@ -223,6 +244,19 @@ def _install_rules() -> None:
     Layout.parse = parse
     TextBlock.make_docx = make_docx
 
+    from pdf2docx.page.Page import Page
+    original_page_parse = Page.parse
+
+    def page_parse(self, **settings):
+        res = original_page_parse(self, **settings)
+        try:
+            _attach_orphan_rules(self)
+        except Exception:
+            log.debug("orphan rules skipped", exc_info=True)
+        return res
+
+    Page.parse = page_parse
+
 
 def _rule_geometry(shape) -> tuple[float, float, float, float, int] | None:
     """(x0, x1, y, толщина, цвет) для горизонтальной линии или тонкой заливки-линии."""
@@ -254,13 +288,16 @@ def _attach_rules(layout) -> None:
         x0, x1, y, width, color = geom
         if x1 - x0 < min_len:
             continue
-        if any(t[0] - 1 <= x0 and x1 <= t[2] + 1 and t[1] - 1 <= y <= t[3] + 1 for t in tables):
-            continue   # граница таблицы
+        if any(t[0] - TABLE_EDGE_TOL <= x0 and x1 <= t[2] + TABLE_EDGE_TOL
+               and t[1] - TABLE_EDGE_TOL <= y <= t[3] + TABLE_EDGE_TOL for t in tables):
+            shape._p2w_rule_done = True
+            continue   # граница таблицы (на скане линии выступают за ячейки на пиксель-другой)
         if _is_underline(texts, x0, x1, y):
+            shape._p2w_rule_done = True
             continue
         overlap = [b for b in texts if min(x1, b.bbox[2]) - max(x0, b.bbox[0]) > 0.2 * min(x1 - x0, b.bbox[2] - b.bbox[0])]
-        above = [b for b in overlap if b.bbox[3] <= y + 1]
-        below = [b for b in overlap if b.bbox[1] >= y - 1]
+        above = [b for b in overlap if b.bbox[3] <= y + 1 or _sits_on(b, y)]
+        below = [b for b in overlap if b.bbox[1] >= y - 1 and not _sits_on(b, y)]
         target = side = None
         if above:
             b = max(above, key=lambda b: b.bbox[3])
@@ -272,10 +309,62 @@ def _attach_rules(layout) -> None:
                 target, side, gap = b, "top", b.bbox[1] - y
         if target is None:
             continue
+        shape._p2w_rule_done = True
         rules = getattr(target, "_p2w_rules", [])
         if not any(r[0] == side for r in rules):
             rules.append((side, width, color, max(0.0, gap - width)))
             target._p2w_rules = rules
+
+
+def _attach_orphan_rules(page) -> None:
+    """Линия, что оказалась в своей полосе листа без текста (линия под шапкой «логотип | шифр»:
+    pdf2docx разложил шапку на две колонки, а линия шире каждой из них), — нижняя граница самых
+    нижних блоков над ней в каждой колонке. В колонтитуле колонки становятся таблицей, и такие
+    границы переходят в нижнюю границу таблицы (headers._layout_table)."""
+    columns = [col for section in page.sections for col in section]
+    texts = [b for col in columns for b in col.blocks if b.is_text_block]
+    if not texts:
+        return
+    width = page.bbox[2] - page.bbox[0] if hasattr(page, "bbox") else 0
+    for col in columns:
+        for shape in list(col.shapes):
+            if getattr(shape, "_p2w_rule_done", False):
+                continue
+            geom = _rule_geometry(shape)
+            if geom is None:
+                continue
+            x0, x1, y, w_, color = geom
+            if x1 - x0 < max(MIN_RULE_LEN, 0.25 * width):
+                continue
+            if _is_underline(texts, x0, x1, y):
+                continue
+            above = [b for b in texts if b.bbox[3] <= y + 1 and y - b.bbox[3] <= 2 * MAX_RULE_GAP
+                     and min(x1, b.bbox[2]) - max(x0, b.bbox[0]) > 0.2 * (b.bbox[2] - b.bbox[0])]
+            if not above:
+                continue
+            # по одному блоку на колонку: самый нижний из блоков, что перекрываются по горизонтали
+            picked = []
+            for b in sorted(above, key=lambda b: -b.bbox[3]):
+                if any(min(b.bbox[2], o.bbox[2]) - max(b.bbox[0], o.bbox[0]) > 0 for o in picked):
+                    continue
+                picked.append(b)
+            if not any(y - b.bbox[3] <= MAX_RULE_GAP for b in picked):
+                continue
+            shape._p2w_rule_done = True
+            for b in picked:
+                rules = getattr(b, "_p2w_rules", [])
+                if not any(r[0] == "bottom" for r in rules):
+                    rules.append(("bottom", w_, color, min(MAX_RULE_GAP, max(0.0, y - b.bbox[3] - w_))))
+                    b._p2w_rules = rules
+
+
+def _sits_on(block, y: float) -> bool:
+    """Линия поля формы проходит под базовой линией последней строки абзаца, задевая выносные
+    («Российская Федерация, Пермский край,» на линии, под ней «(субъект РФ)»): абзац над линией."""
+    lines = getattr(block, "lines", None)
+    last = lines[-1] if lines else None
+    h = (last.bbox[3] - last.bbox[1]) if last is not None else (block.bbox[3] - block.bbox[1])
+    return block.bbox[1] < y - 0.5 * h and block.bbox[3] <= y + 0.45 * h
 
 
 def _is_underline(texts, x0: float, x1: float, y: float) -> bool:

@@ -287,6 +287,22 @@ def find_gost_stamp(page: PageElems, frame: Box) -> Box | None:
     return best
 
 
+STAMP_MAX_TEXTS = 6      # надписей в нижней рамке-колонтитуле «2026 | название | 3»; у таблицы больше
+
+
+def _stamp_like(page: PageElems, box: Box) -> bool:
+    """Рамка у низа листа — штамп, а не таблица в конце страницы: графы штампа («Изм.», «Лист»,
+    «№ докум.», «Подп.»), или пусто, или несколько надписей с номером листа у края рамки."""
+    texts = [e for e in page.elems if e.kind == "text" and geo.contains(box, e.bbox, 1.5)]
+    if not texts or any(STAMP_WORDS.search(e.text) for e in texts):
+        return True
+    if len(texts) > STAMP_MAX_TEXTS:
+        return False
+    edge = 0.12 * (box[2] - box[0])
+    return any(e.text.strip().isdigit() and len(e.text.strip()) <= 3
+               and (e.bbox[0] - box[0] < edge or box[2] - e.bbox[2] < edge) for e in texts)
+
+
 def find_footer_box(page: PageElems, frame: Box | None, sides: list[Box]) -> Box | None:
     W, H = page.width, page.height
     rx0, rx1 = (frame[0], frame[2]) if frame else (0.0, W)
@@ -350,8 +366,15 @@ def _same_place(a: Elem, b: Elem, pa: PageElems, pb: PageElems, top: bool, tol: 
         dy = abs((pa.height - a.bbox[3]) - (pb.height - b.bbox[3]))
     if dy > tol:
         return False
+    if a.kind == "text" and _norm(a.text):
+        # та же надпись на той же высоте у края листа — колонтитул, где бы по горизонтали он ни стоял
+        # (чётные страницы — слева, нечётные — справа; поля при этом бывают разные)
+        return True
     return (abs(a.bbox[0] - b.bbox[0]) <= tol or abs((pa.width - a.bbox[2]) - (pb.width - b.bbox[2])) <= tol
-            or abs((a.bbox[0] + a.bbox[2]) / pa.width - (b.bbox[0] + b.bbox[2]) / pb.width) * pa.width <= 2 * tol)
+            or abs((a.bbox[0] + a.bbox[2]) / pa.width - (b.bbox[0] + b.bbox[2]) / pb.width) * pa.width <= 2 * tol
+            # зеркальные колонтитулы чётных и нечётных страниц: слева на одной — справа на другой
+            or abs(a.bbox[0] - (pb.width - b.bbox[2])) <= tol and abs((pa.width - a.bbox[2]) - b.bbox[0]) <= max(
+                tol, 0.5 * (a.bbox[2] - a.bbox[0])))
 
 
 def _elem_key(e: Elem) -> tuple:
@@ -445,6 +468,8 @@ def detect(pages: list[PageElems]) -> list[Furniture]:
             f.footer = find_footer_box(p, f.frame, f.sides)
             if f.footer is not None and rep_bottom is not None and f.footer[1] < rep_bottom - 20:
                 f.footer = None     # ниже есть повторяющийся низ листа — «рамка» была строками таблицы
+            if f.footer is not None and rep_bottom is None and not _stamp_like(p, f.footer):
+                f.footer = None     # таблица в конце страницы, а не штамп: не повторяется и без граф штампа
         # лист-«бланк»: рамка, штамп, боковой штамп или рамочный нижний блок
         blank = f.frame is not None or bool(f.sides) or f.footer is not None
         if f.footer is None and rep_bottom is not None:

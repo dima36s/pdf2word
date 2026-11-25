@@ -145,6 +145,7 @@ class Conversion:
             pages = ", ".join(str(i + 1) for i in vector[:10]) + ("…" if len(vector) > 10 else "")
             self.stats.warnings.append(f"Текст нарисован линиями (шрифт САПР), страницы распознаны как сканы: {pages}.")
         self.ocr_todo: list[int] = []
+        self.ocr_done: list[int] = []      # распознанные листы (собраны заново из текста)
         if scans and opts.ocr != "off":
             if external_ocr or ocr.tesseract_available():
                 self.ocr_todo = scans
@@ -173,6 +174,7 @@ class Conversion:
             try:
                 if ocr.ocr_replace_page(work, i, lang):   # 0 — иллюстрация, осталась картинкой
                     self.stats.ocr_pages += 1
+                    self.ocr_done.append(i)
             except ocr.OcrError as exc:
                 log.warning("OCR failed on page %s: %s", i + 1, exc)
                 self.ocr_failed(i)
@@ -189,6 +191,7 @@ class Conversion:
         try:
             if ocr.apply_hocr(self._ensure_work(), i, prep, hocr):
                 self.stats.ocr_pages += 1
+                self.ocr_done.append(i)
         except Exception as exc:
             log.warning("OCR apply failed on page %s: %s", i + 1, exc)
             self.ocr_failed(i)
@@ -205,6 +208,13 @@ class Conversion:
 
         stats, progress, doc, opts = self.stats, self.progress, self.doc, self.opts
         warnings_before = list(stats.warnings)
+
+        # номера страниц на распознанных листах — одной надписью в одном месте (потом — в колонтитул)
+        if len(self.ocr_done) >= 3:
+            try:
+                ocr.normalize_page_numbers(self.work, sorted(self.ocr_done))
+            except Exception:
+                log.exception("page numbers of scanned pages not normalized")
 
         # фоновые плашки
         panels = {}
@@ -367,7 +377,8 @@ class Conversion:
 
         if getattr(self, "_furniture_off", False):
             return None
-        eligible = [i for i in self.targets if self.kinds[i] == "text" and not self.work[i].rotation]
+        done = set(getattr(self, "ocr_done", ()))
+        eligible = [i for i in self.targets if (self.kinds[i] == "text" or i in done) and not self.work[i].rotation]
         if not eligible:
             return None
         try:

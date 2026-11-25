@@ -28,7 +28,7 @@ NUM = r"\d{1,2}(?:\.\d{1,2}){0,3}"
 HEADING_RE = re.compile(rf"^\s*({NUM})\.?\s+(\S.*)$", re.S)
 NUMBER_ONLY_RE = re.compile(rf"^\s*({NUM})\.?\s*$")
 TOC_RE = re.compile(r"^(?P<title>.*?\S)\s*(?:[.·…]\s*){4,}(?P<page>\d{1,4})\s*$", re.S)
-TOC_TAB_RE = re.compile(r"^(?P<title>.*?\S)\t+(?P<page>\d{1,4})\s*$", re.S)
+TOC_TAB_RE = re.compile(r"^(?P<title>.*?\S)[ \u00a0]*\t+(?P<page>\d{1,4})\s*$", re.S)
 STRUCT_HEADINGS = {"содержание", "введение", "заключение", "обозначения и сокращения", "термины и определения",
                    "список использованных источников", "библиография", "перечень сокращений",
                    "сокращения", "аннотация", "реферат"}
@@ -36,9 +36,17 @@ STRUCT_HEADINGS = {"содержание", "введение", "заключен
 
 # --------------------------------------------------------------------------- текст и формат
 
+def _text_nodes(p):
+    """w:t и табуляции в тексте абзаца (w:tab внутри w:r; w:tab в w:tabs — это позиции, не текст)."""
+    for node in p.iter(w("t"), w("tab")):
+        if node.tag == w("tab") and (node.getparent() is None or node.getparent().tag != w("r")):
+            continue
+        yield node
+
+
 def _ptext(p) -> str:
     parts = []
-    for node in p.iter(w("t"), w("tab")):
+    for node in _text_nodes(p):
         parts.append("\t" if node.tag == w("tab") else (node.text or ""))
     return "".join(parts)
 
@@ -517,7 +525,7 @@ def _replace_leader(p, start: int, end: int) -> None:
     """Удалить символы [start, end) текста абзаца и поставить на их место табуляцию."""
     pos = 0
     tab_done = False
-    for node in list(p.iter(w("t"), w("tab"))):
+    for node in list(_text_nodes(p)):
         text = "\t" if node.tag == w("tab") else (node.text or "")
         a, b = pos, pos + len(text)
         pos = b
@@ -565,6 +573,7 @@ def fix_toc(docx) -> int:
         else:
             candidates.append((el, None, None, sec))
     done = []
+    leaders: dict[int, str | None] = {}
     for k, (p, m, kind, s) in enumerate(candidates):
         if m is None:
             continue
@@ -575,6 +584,7 @@ def fix_toc(docx) -> int:
                 continue
         _replace_leader(p, len(m.group("title")), m.start("page"))
         done.append((k, p, s))
+        leaders[id(p)] = "dot" if kind == "dots" else None      # без отточия в PDF — без него и в Word
     for group in _toc_groups(done):
         s = group[0][2]
         width = widths[min(s, len(widths) - 1)] if widths else 9355
@@ -582,13 +592,44 @@ def fix_toc(docx) -> int:
                                   else 0 for _, p, _ in group], width)
         labels = _align_toc_labels([p for _, p, _ in group])
         for _, p, _ in group:
-            stops = [("right", max(0, width - right), "dot")]
+            stop = max(0, width - right)
+            stops = [("right", stop, leaders.get(id(p), "dot"))]
             if p in labels:
                 stops.insert(0, ("left", labels[p], None))
+            else:
+                # левые табуляции pdf2docx (номер главы картинкой, текст пункта с выступом) остаются:
+                # без них табуляция после номера уходила к номеру страницы — отточие перед текстом
+                lead = _leading_tabs(p)
+                stops = [("left", pos, None) for pos in _left_stops(p) if pos < stop - 300][:lead] + stops
             if right:
                 _set_ind(p, right=right)
             _set_tabs(p, stops)
     return len(done)
+
+
+def _leading_tabs(p) -> int:
+    """Сколько табуляций стоит до текста пункта (после номера-картинки, номера главы)."""
+    n = 0
+    for el in p.iter(w("t"), w("tab")):
+        if el.tag == w("tab"):
+            if el.getparent().tag == w("tabs"):
+                continue
+            n += 1
+        elif (el.text or "").strip():
+            break
+    return n
+
+
+def _left_stops(p) -> list[int]:
+    tabs = _ppr(p).find(w("tabs"))
+    out = []
+    for t in tabs if tabs is not None else ():
+        if t.get(w("val")) == "left":
+            try:
+                out.append(int(float(t.get(w("pos")))))
+            except (TypeError, ValueError):
+                pass
+    return sorted(out)
 
 
 TOC_LABEL_RE = re.compile(r"^(?P<label>\d{1,3}(?:\.\d{1,3}){0,5}\.?)(?P<gap>[ \u00a0]+)\S")

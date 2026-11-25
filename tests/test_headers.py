@@ -9,6 +9,7 @@ from docx.enum.section import WD_SECTION
 from docx.shared import Pt
 
 from app import headers
+from lxml import etree
 
 PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND"
@@ -205,3 +206,58 @@ def test_empty_header_after_real_one_stays_inside_margin(tmp_path):
     s0, s1 = Document(out).sections
     assert s1.header_distance.pt <= 13.0 and s1.footer_distance.pt <= 11.0
     assert s0.header_distance.pt > 30                     # у листа с шапкой расстояние прежнее
+
+
+def test_page_number_inside_text_becomes_field():
+    # «- 1/9 -», «- 2/9 -»: номер листа внутри надписи → поле PAGE, «/9 -» остаётся текстом
+    bands = {}
+    for pid in range(3):
+        d = Document()
+        d.add_paragraph(f"- {pid + 1}/9 -")
+        bands[pid] = {"header": headers.prepare(d)}
+    assert headers.page_fields(bands) == 1
+    xml = etree.tostring(bands[1]["header"].elements[0]).decode()
+    assert 'w:instr=" PAGE "' in xml and ">2<" in xml and "/9 -" in xml and "- 2/9" not in xml
+    assert headers._canonical(bands[0]["header"]) == headers._canonical(bands[2]["header"])
+
+
+def test_spaces_around_page_number_stay_outside_field():
+    bands = {}
+    for pid in range(3):
+        d = Document()
+        p = d.add_paragraph()
+        p.add_run("Страница")
+        p.add_run(f" {pid + 1} ")
+        p.add_run("из 7")
+        bands[pid] = {"footer": headers.prepare(d)}
+    assert headers.page_fields(bands) == 1
+    xml = etree.tostring(bands[0]["footer"].elements[0]).decode()
+    field = xml[xml.index("<w:fldSimple"):xml.index("</w:fldSimple>")]
+    assert ">1<" in field and " 1 " not in field
+
+
+def test_rule_under_logo_and_code_becomes_table_bottom():
+    # линия под шапкой «логотип | шифр» на всю ширину: нижняя граница абзаца в каждой колонке
+    # (vectorfix._attach_orphan_rules) → в колонтитуле одна нижняя граница таблицы, а не куски
+    from app import headers
+    W = headers.w
+
+    def para(text, space):
+        p = etree.Element(W("p"))
+        ppr = etree.SubElement(p, W("pPr"))
+        bdr = etree.SubElement(ppr, W("pBdr"))
+        etree.SubElement(bdr, W("bottom"), {W("val"): "single", W("sz"): "6", W("space"): str(space),
+                                            W("color"): "000000"})
+        r = etree.SubElement(p, W("r"))
+        etree.SubElement(r, W("t")).text = text
+        return p
+
+    out = headers._layout_table([[para("ПроТех", 9)], [para("Е110-0162-УКК.ОЛ1", 30)]], [3600, 6200])
+    tbl = out[0]
+    bottom = tbl.find(f"{W('tblPr')}/{W('tblBorders')}/{W('bottom')}")
+    assert bottom.get(W("val")) == "single" and bottom.get(W("space")) == "0"
+    assert not list(tbl.iter(W("pBdr")))
+    mar = tbl.find(f"{W('tblPr')}/{W('tblCellMar')}")
+    assert [etree.QName(c).localname for c in mar] == ["left", "bottom", "right"]
+    assert mar.find(W("bottom")).get(W("w")) == "180"          # 9 pt от низа логотипа до линии
+

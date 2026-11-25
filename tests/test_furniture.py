@@ -216,3 +216,32 @@ def test_table_header_row_is_not_page_header():
     f = result[2]
     assert f.footer is not None and f.footer[1] > 780          # «стр. N» — в нижнем колонтитуле
     assert f.header is not None and f.header[3] < 58           # шапка — только плашка
+
+
+def test_table_at_page_end_is_not_footer():
+    # таблица в конце страницы (ГПЗУ, раздел 6): рамка у низа листа, но без граф штампа и с длинным текстом
+    W, H = 595.3, 841.9
+    el = [_text(71, 90 + 16 * k, 540, 102 + 16 * k, f"Строка {k}") for k in range(30)]
+    el += [_box(68, 640, 540, 790), _line(170, 640, 170, 790), _line(300, 670, 300, 790), _line(420, 670, 420, 790)]
+    el += [_text(75, 645 + 12 * k, 165, 655 + 12 * k, w) for k, w in enumerate(
+        ["Наименование зоны с", "особыми условиями", "использования", "территории с указанием",
+         "объекта, в отношении", "которого установлена", "такая зона"])]
+    el += [_text(180, 645, 530, 655, "Перечень координат характерных точек"), _text(230, 700, 240, 710, "1"),
+           _text(360, 700, 370, 710, "2"), _text(480, 700, 490, 710, "3")]
+    (f,) = fu.detect([fu.PageElems(W, H, el)])
+    assert f.footer is None
+
+
+def test_mirrored_even_odd_headers_repeat():
+    # «Отчёт о НИР» справа на нечётных и слева на чётных страницах, номер — так же
+    W, H = 595.3, 841.9
+    pages = []
+    for k in range(5):
+        odd = k % 2 == 0
+        hx = (480, 540) if odd else (55.3, 115.3)
+        el = [_text(hx[0], 36, hx[1], 48, "Отчёт о НИР"),
+              _text(530 if odd else 59, 790, 536 if odd else 65, 800, str(k + 1))]
+        el += [_text(71, 90 + 16 * j, 540, 102 + 16 * j, f"Строка {k} {j}") for j in range(20)]
+        pages.append(fu.PageElems(W, H, el))
+    for f in fu.detect(pages):
+        assert f.header is not None and f.footer is not None
