@@ -121,3 +121,91 @@ def test_caption_row_splits_into_columns():
     parts = _phrases(words, 10 * k)
     assert [[x.text for x in p] for p in parts] == [["(при", "наличии)"], ["(подпись)"], ["(расшифровка", "подписи)"]]
 
+
+def _photo_pdf(px_w=2436, px_h=1702, ppi=72):
+    """Снимок с телефона в PDF: страница размером с картинку в пикселях (iOS Quartz)."""
+    import io
+    import pymupdf
+    img = Image.new("RGB", (px_w, px_h), (240, 240, 235))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    doc = pymupdf.open()
+    page = doc.new_page(width=px_w * 72 / ppi, height=px_h * 72 / ppi)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    return doc
+
+
+def test_phone_photo_page_is_a4():
+    # 86 × 60 см «страница» из пикселей снимка — это лист A4: рендер в пикселях листа, а не 40 Мпикс
+    doc = _photo_pdf()
+    long_in, short_in = ocr.photo_page_inches(doc[0])
+    assert abs(long_in - 842 / 72) < 0.01 and abs(short_in - long_in * 1702 / 2436) < 0.01
+    img, dpi = ocr.render_page(doc[0], 300)
+    assert max(img.size) <= 2436 * ocr.PHOTO_UPSCALE + 2 and 200 <= dpi <= 300
+    # настоящий скан A4 (300 dpi) — не снимок
+    assert ocr.photo_page_inches(_photo_pdf(2480, 3508, 300)[0]) is None
+    # A3 и меньше по размеру страницы — не трогаем
+    assert ocr.photo_page_inches(_photo_pdf(1191, 842)[0]) is None
+
+
+def test_flatten_light_whitens_paper_keeps_ink():
+    # тень от руки: фон от 160 до 250; текст и тонкая серая линия остаются тёмными, поле стола — белеет
+    w, h = 1200, 800
+    grad = np.tile(np.linspace(160, 250, w, dtype=np.float32), (h, 1))
+    arr = np.stack([grad] * 3, axis=-1)
+    arr[400:403, 100:1100] = (grad[400:403, 100:1100, None] * 0.55)        # линия таблицы
+    arr[200:230, 300:320] = 40                                              # буква
+    arr[:, :12] = (60, 120, 60)                                              # зелёный стол у края
+    out = np.asarray(ocr.flatten_light(Image.fromarray(arr.astype(np.uint8)).convert("RGB")))
+    assert out[100, 100:1100].mean() > 245 and out[700, 1000].mean() > 245
+    assert out[401, 150].mean() < 170 and out[401, 1050].mean() < 170
+    assert out[215, 310].mean() < 120
+    assert out[:, :5].mean() > 250
+
+
+def test_curved_rows_are_straightened():
+    # изогнутый лист: горизонтали к правому краю уходят вверх по дуге (до 20 px)
+    w, h = 2400, 1800
+    img = Image.new("L", (w, h), 255)
+    dr = ImageDraw.Draw(img)
+    for y0 in range(300, 1500, 150):
+        pts = [(x, y0 - 20 * ((x - 1200) / 1200) ** 2 * (1 if x > 1200 else 0.3)) for x in range(150, 2250, 10)]
+        dr.line(pts, fill=60, width=4)
+    rgb = img.convert("RGB")
+    _, straight = ocr.straighten_rows(rgb, img, 300)
+    arr = np.asarray(straight)
+    for y0 in range(300, 1500, 300):
+        ys = []
+        for x in (300, 1200, 2100):
+            col = arr[y0 - 40:y0 + 40, x]
+            ys.append(int(col.argmin()))
+        assert max(ys) - min(ys) <= 4, (y0, ys)
+
+
+def test_comb_reading_votes_for_cell_count():
+    # общий проход «00», отдельное чтение ошибается «60», двойное увеличение потеряло знак
+    assert ocr.vote_comb((0, 0, 140, 70), ["00", "60", "0", "00", "0"]) == "00"
+    # «строкой» путает последнюю цифру — берётся из основных: «0076»
+    assert ocr.vote_comb((0, 0, 280, 70), ["", "0076", "0075", "0070", "0070"]) == "0076"
+    assert ocr.vote_comb((0, 0, 140, 70), ["", "", "", "РФ", "И"]) == "РФ"
+
+
+def test_comb_words_replaced_and_split_by_dashes():
+    # общий проход прочёл «-59-2-00-» одним словом через три группы; второе слово — мусор от стенок
+    rects = [(100, 0, 240, 70), (300, 0, 370, 70), (430, 0, 570, 70)]
+    words = [Word("[519]", 100, 5, 240, 65, 40), Word("-2-0О-", 250, 5, 570, 65, 50)]
+    ln = Line((100, 0, 570, 70), 60, 30, words)
+    res = OcrResult([Paragraph([ln])], [])
+    cand = {rects[0]: ["59", "59", "39", "59"], rects[1]: ["2", "", "2", "З"], rects[2]: ["00", "60", "0", "00"]}
+    cand[(245, 30, 260, 34)] = "-"
+    ocr.put_combs(res, cand)
+    assert [w.text for w in ln.words] == ["59", "-", "2", "00"]
+
+
+def test_unsure_words_under_seal_dropped():
+    words = [Word("Pte,", 300, 1130, 340, 1150, 42), Word("Сухаревой", 1000, 1130, 1200, 1150, 92),
+             Word("Дата", 320, 1300, 380, 1330, 88)]
+    res = OcrResult([Paragraph([Line((0, 1100, 1300, 1350), 1150, 30, words)])], [])
+    ocr.drop_unsure_in_marks(res, [(289, 921, 833, 1373)])
+    assert [w.text for w in res.paragraphs[0].lines[0].words] == ["Сухаревой", "Дата"]
+

@@ -443,3 +443,17 @@ def test_cad_grid_pieces_join_into_lines():
     assert merge_collinear([(0, 0, 1, 10), (0, 12, 1, 20)], [0, 0]) == []
     assert merge_collinear([(0, 0, 1, 10), (0, 10, 1, 20)], [0, 1]) == []
 
+
+def test_line_across_cell_border_is_split():
+    # «Обозначение Перечень координат…»: две ячейки на одной базовой линии, MuPDF собрал одну строку.
+    # Целую pdf2docx выносил из таблицы — режем по вертикальной линии
+    from app.textfix import Barriers, split_at_barriers
+
+    ln = _line("Обозначение Перечень", 70, 100)
+    border = 70 + 6 * len("Обозначение ") - 3
+    parts = split_at_barriers(ln, Barriers([(border, 80, 140)]))
+    assert [_text_of(p).strip() for p in parts] == ["Обозначение", "Перечень"]
+    assert parts[1]["bbox"][0] > border
+    # линия выше строки — не режем
+    assert len(split_at_barriers(ln, Barriers([(border, 10, 60)]))) == 1
+

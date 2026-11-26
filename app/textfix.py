@@ -451,6 +451,56 @@ def embed_fragments(lines: list[dict]) -> list[dict]:
     return out
 
 
+def split_at_barriers(line: dict, barriers: Barriers) -> list[dict]:
+    """Строка, которую MuPDF собрал через вертикальную линию таблицы («Обозначение Перечень
+    координат…» — две ячейки на одной базовой линии), режется по линии на строки ячеек.
+
+    Целую строку поперёк границы pdf2docx не кладёт ни в одну ячейку и выносит из таблицы."""
+    if not _horizontal(line):
+        return [line]
+    y0, y1 = line["bbox"][1], line["bbox"][3]
+    flat = [(si, ci, c) for si, sp in enumerate(line["spans"]) for ci, c in enumerate(sp.get("chars", ()))]
+    cuts = []
+    prev = None
+    for k, (_, _, c) in enumerate(flat):
+        if c.get("c", "").isspace():
+            continue
+        if prev is not None and barriers.between(flat[prev][2]["bbox"][2] - 0.5, c["bbox"][0] + 0.5, y0, y1):
+            cuts.append(k)
+        prev = k
+    if not cuts:
+        return [line]
+    out = []
+    bounds = [0] + cuts + [len(flat)]
+    for a, b in zip(bounds, bounds[1:]):
+        part = flat[a:b]
+        while part and part[-1][2].get("c", "").isspace():
+            part = part[:-1]
+        if not part:
+            continue
+        spans = []
+        for si, _, c in part:
+            if not spans or spans[-1][0] != si:
+                spans.append((si, []))
+            spans[-1][1].append(c)
+        new_spans = []
+        for si, chars in spans:
+            sp = dict(line["spans"][si])
+            sp["chars"] = chars
+            sp["bbox"] = _span_bbox(chars)
+            if "text" in sp:
+                sp["text"] = "".join(c.get("c", "") for c in chars)
+            new_spans.append(sp)
+        nl = dict(line)
+        nl["spans"] = new_spans
+        bb = new_spans[0]["bbox"]
+        for sp in new_spans[1:]:
+            bb = _union(bb, sp["bbox"])
+        nl["bbox"] = bb
+        out.append(nl)
+    return out or [line]
+
+
 def normalize_text_blocks(blocks: list[dict], barriers: Barriers = NO_BARRIERS) -> list[dict]:
     starts = line_starts(blocks)
     for block in blocks:
@@ -461,6 +511,8 @@ def normalize_text_blocks(blocks: list[dict], barriers: Barriers = NO_BARRIERS) 
             for span in line["spans"]:
                 _fix_symbol_chars(span)
         lines = embed_fragments(lines)
+        if barriers:
+            lines = [part for ln in lines for part in split_at_barriers(ln, barriers)]
         merged = [lines[0]]
         for ln in lines[1:]:
             if not _try_merge(merged[-1], ln, barriers, starts):

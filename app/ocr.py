@@ -248,17 +248,30 @@ def detect_table_rules(gray: Image.Image, dpi: float) -> tuple[list[Rect], list[
     return r.h, r.v
 
 
-def detect_rules(gray: Image.Image, dpi: float) -> Rules:
+PHOTO_DARK = 185            # порог «тёмного» на выровненном снимке: тонкие линии там серые
+PHOTO_DRIFT = 0.02          # дюйма: линия на снимке гуляет (бумага не плоская, края листа выгнуты)
+
+
+def detect_rules(gray: Image.Image, dpi: float, photo: bool = False, ignore=None) -> Rules:
+    """ignore — маска пикселей, которые не бывают линиями (цветные чернила печати на снимке)."""
     import numpy as np
     arr = np.asarray(gray)
-    dark = arr < 150
+    dark = arr < (PHOTO_DARK if photo else 150)
+    if ignore is not None:
+        dark = dark & ~ignore
     tol = max(2, int(dpi / 75))
     h_mask = _erode(_dilate(dark, tol, 1), tol, 1)       # закрыть разрывы в отсканированных линиях
     v_mask = _erode(_dilate(dark, tol, 0), tol, 0)
     max_thick = max(3, int(dpi * 0.03))
+    if photo:
+        # линия снимка — «лесенка» со сдвигом на пиксель: размываем поперёк, чтобы ступени слились
+        drift = max(2, int(dpi * PHOTO_DRIFT))
+        h_mask = _erode(_dilate(_dilate(dark, drift, 0), tol, 1), tol, 1)
+        v_mask = _erode(_dilate(_dilate(dark, drift, 1), tol, 0), tol, 0)
+        max_thick += 2 * drift           # размытие + изгиб линии к краям листа
     h = _segments(h_mask, int(dpi * 0.35), max_thick, True)
     v = _segments(v_mask, int(dpi * 0.18), max_thick, False)
-    combs = find_comb_boxes(dark, dpi)
+    combs = find_comb_boxes(dark, dpi, photo)
     if combs:
         h = [a for a in h if not _covered_by(a, combs, tol * 2)]
         v = [b for b in v if not _covered_by(b, combs, tol * 2)]
@@ -319,7 +332,7 @@ def _covered_by(r: Rect, boxes: list[Rect], tol: float) -> bool:
 COMB_MIN, COMB_MAX = 0.10, 0.45      # дюйма: высота клетки «номера в клетках»
 
 
-def find_comb_boxes(dark, dpi: float) -> list[Rect]:
+def find_comb_boxes(dark, dpi: float, photo: bool = False) -> list[Rect]:
     """Клетки для букв и цифр («РФ-[5][9]-[2]-[0][0]…» в номере ГПЗУ, ИНН, КПП).
 
     Это отдельные маленькие замкнутые рамки (несколько клеток подряд — одна рамка с перегородками)
@@ -337,10 +350,12 @@ def find_comb_boxes(dark, dpi: float) -> list[Rect]:
             continue
         ring = labels[y:y + h, x:x + w] == k
         band = max(2, int(dpi * 0.012))
+        if photo:
+            band += int(0.025 * w)       # на снимке рамка чуть наклонена: верх и низ гуляют на пиксели
         sides = (ring[:band].any(axis=0).mean(), ring[-band:].any(axis=0).mean(),
                  ring[:, :band].any(axis=1).mean(), ring[:, -band:].any(axis=1).mean())
-        if min(sides) < 0.75:                         # стенки скана бывают с разрывами
-            continue
+        if min(sides[2:]) < 0.75 or min(sides[:2]) < (0.5 if photo else 0.75):
+            continue                                  # стенки скана бывают с разрывами (на снимке — верх и низ)
         if area > 0.45 * w * h:                       # залитый прямоугольник, а не рамка
             continue
         # перегородки: столбцы, закрашенные почти на всю высоту
@@ -418,6 +433,30 @@ def find_ink_marks(rgb: Image.Image, dpi: float, mask=None) -> list[Rect]:
             continue                                  # редкие цветные точки
         out.append((x0, y0, x1, y1))
     return out
+
+
+RULE_MAX_PT = 1.5
+
+
+def erase_line_crumbs(gray: Image.Image, rules: list[Rect], dpi: float, level: int) -> Image.Image:
+    """Обрывки изогнутых линий снимка, не попавшие в полосу линии: тонкие горизонтальные штрихи
+    рядом с линией таблицы. Tesseract читал их как «- - - - -» в ячейках."""
+    import cv2
+    import numpy as np
+    if not rules:
+        return gray
+    arr = np.asarray(gray).copy()
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((arr < level).astype(np.uint8), connectivity=8)
+    thin = max(3, int(dpi * 0.02))
+    near = max(4, int(dpi * 0.05))
+    for k in range(1, n):
+        x, y, w, h, _ = (int(v) for v in stats[k])
+        if h > thin or w < 3 * h:
+            continue
+        cy = y + h / 2
+        if any(r[0] - near <= x and x + w <= r[2] + near and r[1] - near <= cy <= r[3] + near for r in rules):
+            arr[labels == k] = 255
+    return Image.fromarray(arr)
 
 
 def erase_rules(gray: Image.Image, rules: list[Rect], pad: int = 2) -> Image.Image:
@@ -791,19 +830,21 @@ def build_text_page(out_doc: pymupdf.Document, res: OcrResult, img: Image.Image,
 
     h_rules = [r for r in h_rules if not _in_photo(r)]
     v_rules = [r for r in v_rules if not _in_photo(r)]
+    # толщина линии — не толще RULE_MAX_PT: на снимке полоса линии шире самой линии (изгиб листа),
+    # и толстая линия задевала первую строку ячейки — pdf2docx выносил её из таблицы
     for x0, y0, x1, y1 in h_rules:
         y = (y0 + y1) / 2 * s
-        page.draw_line((x0 * s, y), (x1 * s, y), color=(0, 0, 0), width=max(0.5, (y1 - y0) * s))
+        page.draw_line((x0 * s, y), (x1 * s, y), color=(0, 0, 0), width=min(RULE_MAX_PT, max(0.5, (y1 - y0) * s)))
     for x0, y0, x1, y1 in v_rules:
         x = (x0 + x1) / 2 * s
-        page.draw_line((x, y0 * s), (x, y1 * s), color=(0, 0, 0), width=max(0.5, (x1 - x0) * s))
+        page.draw_line((x, y0 * s), (x, y1 * s), color=(0, 0, 0), width=min(RULE_MAX_PT, max(0.5, (x1 - x0) * s)))
     # линии полей формы («Российская Федерация, Пермский край» над «(субъект РФ)») и разделители:
     # дальше они становятся границей абзаца (vectorfix)
     for x0, y0, x1, y1 in free_rules:
         if _in_photo((x0, y0, x1, y1)):
             continue
         y = (y0 + y1) / 2 * s
-        page.draw_line((x0 * s, y), (x1 * s, y), color=(0, 0, 0), width=max(0.5, (y1 - y0) * s))
+        page.draw_line((x0 * s, y), (x1 * s, y), color=(0, 0, 0), width=min(RULE_MAX_PT, max(0.5, (y1 - y0) * s)))
 
     # кегль: медиана по абзацу, затем выравнивание к основному кеглю страницы
     raw_sizes = []
@@ -986,13 +1027,60 @@ def _lone_dash(words: list[Word], k: int, fs_px: float, v_rules: list[Rect]) -> 
 
 # --------------------------------------------------------------------------- точка входа
 
+PHOTO_PAGE_MIN = 1370.0     # pt: длинная сторона больше A3 (1191 pt) с запасом
+PHOTO_MAX_PPI = 100.0       # снимок, у которого пиксель ≈ пункт листа: размер листа ничего не значит
+PHOTO_LONG_IN = 842 / 72    # такой снимок — лист A4 (длинная сторона, дюймы)
+PHOTO_UPSCALE = 1.5         # не увеличивать снимок больше чем в полтора раза
+PHOTO_EDGE = 0.02           # доля стороны снимка у края: стол и тень за краем листа (поля листа шире)
+
+
+def photo_page_inches(page: pymupdf.Page) -> tuple[float, float] | None:
+    """Снимок листа с телефона (iOS «Сканировать документы», Quartz PDFContext): страница — одна
+    картинка, а размер страницы равен её размеру в пикселях (72 «dpi»), 86 × 60 см вместо A4.
+
+    По такому размеру распознавание рендерило 40 млн пикселей (2 ГБ памяти, в браузере — отказ),
+    пороги в дюймах промахивались в три раза, а в Word выходил лист 86 × 60 см с текстом 30 pt.
+    Возвращает настоящий размер листа в дюймах (A4 с пропорциями снимка) или None."""
+    r = page.rect
+    if max(r.width, r.height) < PHOTO_PAGE_MIN or page.get_text("text").strip():
+        return None
+    try:
+        images = page.get_images(full=True)
+        if len(images) != 1:
+            return None
+        bbox = page.get_image_bbox(images[0])
+        width_px = images[0][2]
+    except Exception:
+        return None
+    if bbox.is_empty or bbox.width * bbox.height < 0.9 * r.width * r.height:
+        return None
+    ppi = width_px / (bbox.width / 72)
+    if ppi > PHOTO_MAX_PPI:
+        return None
+    long_in = PHOTO_LONG_IN
+    short_in = long_in * min(r.width, r.height) / max(r.width, r.height)
+    return (long_in, short_in) if r.width >= r.height else (short_in, long_in)
+
+
 def render_page(page: pymupdf.Page, dpi: int) -> tuple[Image.Image, float]:
     w_in, h_in = page.rect.width / 72, page.rect.height / 72
+    phys = photo_page_inches(page)
+    if phys is not None:
+        # рендер в пикселях настоящего листа: dpi листа → масштаб страницы, но не крупнее снимка × 1,5
+        scale = min(dpi * phys[0] / w_in, PHOTO_UPSCALE * _native_ppi(page))
+        pix = page.get_pixmap(dpi=max(int(scale), 1), alpha=False, colorspace=pymupdf.csRGB)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        return img, pix.width / phys[0]
     dpi = min(dpi, int(math.sqrt(MAX_RENDER_PIXELS / max(w_in * h_in, 0.01))))
     pix = page.get_pixmap(dpi=dpi, alpha=False, colorspace=pymupdf.csRGB)
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     # фактический dpi по ширине (get_pixmap округляет размеры)
     return img, pix.width / w_in
+
+
+def _native_ppi(page: pymupdf.Page) -> float:
+    img = page.get_images(full=True)[0]
+    return img[2] / (page.get_image_bbox(img).width / 72)
 
 
 @dataclass
@@ -1005,12 +1093,214 @@ class PreparedScan:
     v_rules: list[Rect]
     free_rules: list[Rect] = field(default_factory=list)   # линии полей формы, разделители
     marks: list[Rect] = field(default_factory=list)        # печати и подписи цветными чернилами
+    combs: list[Rect] = field(default_factory=list)        # «номер в клетках»: рамки групп клеток
+
+
+def flatten_light(img: Image.Image) -> Image.Image:
+    """Снимок листа телефоном: свет неровный (тень от руки, серый угол, зелёный стол по краю), тонкие
+    линии таблиц светлее порога «тёмного». Каждый канал делится на фон — его даёт морфологическое
+    закрытие в уменьшенной копии (текст и линии тоньше окна, фон — нет): бумага становится белой,
+    чернила сохраняют цвет, поле за краем листа исчезает."""
+    import cv2
+    import numpy as np
+    arr = np.asarray(img).astype(np.float32)
+    h, w = arr.shape[:2]
+    f = max(1, min(h, w) // 400)
+    small = cv2.resize(arr, (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA)
+    k = max(7, (min(small.shape[:2]) // 25) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bg = cv2.morphologyEx(small, cv2.MORPH_CLOSE, kernel)
+    bg = cv2.GaussianBlur(bg, (0, 0), k / 3)
+    bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = np.clip(arr / np.maximum(bg, 1.0) * 255.0, 0, 255).astype(np.uint8)
+    # край снимка — стол, тень, край листа: текста там нет (поля листа шире), заливаем белым
+    by, bx = max(2, int(h * PHOTO_EDGE)), max(2, int(w * PHOTO_EDGE))
+    out[:by], out[-by:], out[:, :bx], out[:, -bx:] = 255, 255, 255, 255
+    return Image.fromarray(out)
+
+
+DEWARP_MIN_SPREAD = 0.3     # градусов: наклон линий меняется по листу — бумага изогнута
+DEWARP_MAX_ANGLE = 4.0
+
+
+def _line_angles(dark, dpi: float, vertical: bool):
+    """Длинные почти горизонтальные (или вертикальные) отрезки: (координата середины поперёк, угол)."""
+    import cv2
+    import numpy as np
+    m = dark.T if vertical else dark
+    found = cv2.HoughLinesP(np.ascontiguousarray(m), 1, np.pi / 1800, threshold=int(dpi),
+                            minLineLength=int(dpi * 1.5), maxLineGap=int(dpi * 0.06))
+    out = []
+    if found is None:
+        return out
+    for x1, y1, x2, y2 in found.reshape(-1, 4).tolist():
+        if x2 == x1:
+            continue
+        a = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        if abs(a) <= DEWARP_MAX_ANGLE:
+            out.append(((y1 + y2) / 2, a))
+    return out
+
+
+def _angle_profile(samples, length: int, step: int):
+    """Наклон как функция координаты: медиана по полосам, между полосами — линейно."""
+    import numpy as np
+    if len(samples) < 4:
+        return None
+    angles = [a for _, a in samples]
+    if max(angles) - min(angles) < DEWARP_MIN_SPREAD:
+        return None
+    centers, values = [], []
+    for start in range(0, length, step):
+        band = [a for c, a in samples if start <= c < start + step]
+        if band:
+            centers.append(start + step / 2)
+            values.append(float(np.median(band)))
+    if len(centers) < 2:
+        return None
+    return np.interp(np.arange(length), centers, values)
+
+
+def dewarp_photo(img: Image.Image, gray: Image.Image, dpi: float) -> tuple[Image.Image, Image.Image]:
+    """Снимок изогнутого листа: линии таблицы наверху наклонены на 2°, в середине ровные, внизу —
+    в другую сторону. Общий поворот этого не исправит, и линии таблиц не находились (каждая —
+    «лесенка» толще допуска). Наклон горизонталей измеряется по высоте листа, вертикалей — по
+    ширине, и снимок выпрямляется сдвигом строк и столбцов (cv2.remap)."""
+    import cv2
+    import numpy as np
+    arr = np.asarray(gray)
+    dark = ((arr < PHOTO_DARK) * 255).astype(np.uint8)
+    h, w = arr.shape
+    step = max(1, int(dpi))
+    rows = _angle_profile(_line_angles(dark, dpi, False), h, step)
+    cols = _angle_profile(_line_angles(dark, dpi, True), w, step)
+    if rows is None and cols is None:
+        return img, gray
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    map_y = ys + ((xs - w / 2) * np.tan(np.radians(rows))[:, None]).astype(np.float32) if rows is not None else ys
+    map_x = xs + ((ys - h / 2) * np.tan(np.radians(cols))[None, :]).astype(np.float32) if cols is not None else xs
+    del ys, xs
+    out_gray = cv2.remap(arr, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=255)
+    out_img = cv2.remap(np.asarray(img), map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(255, 255, 255))
+    return Image.fromarray(out_img), Image.fromarray(out_gray)
+
+
+TRACK_STEP = 8          # px: шаг отслеживания линии
+TRACK_WIN = 3           # px: на сколько линия может сместиться за шаг
+TRACK_DARK = 200        # средняя яркость окна на линии
+TRACK_MISS = 6          # шагов подряд без линии — конец линии
+TRACK_GRID = 16         # px: шаг сетки поля смещений
+TRACK_MIN_SHARE = 0.35  # доля ширины листа: короче — подчёркивание, а не линия таблицы
+
+
+def _track_line(arr, x: int, y: int, direction: int):
+    """Проходит тёмную горизонтальную линию от (x, y) влево или вправо: [(x, y)]."""
+    h, w = arr.shape
+    pts, miss = [], 0
+    while 0 <= x < w and miss <= TRACK_MISS:
+        y0, y1 = max(0, y - TRACK_WIN), min(h, y + TRACK_WIN + 1)
+        col = arr[y0:y1, max(0, x - TRACK_STEP // 2):x + TRACK_STEP // 2 + 1].mean(axis=1)
+        k = int(col.argmin())
+        if col[k] < TRACK_DARK:
+            y, miss = y0 + k, 0
+            pts.append((x, y))
+        else:
+            miss += 1
+        x += direction * TRACK_STEP
+    return pts
+
+
+def curve_field(gray: Image.Image, dpi: float):
+    """Поле сдвигов по вертикали, выпрямляющее изогнутые горизонтали (край листа загнут: линия
+    таблицы к правому краю уходит на 20 пикселей вверх, и наклоном это не исправить). Каждая
+    длинная линия прослеживается по всей длине, её точки встают на общую высоту; между линиями —
+    линейно. None — линий мало."""
+    import cv2
+    import numpy as np
+    arr = np.asarray(gray).astype(np.float32)
+    h, w = arr.shape
+    dark = ((arr < PHOTO_DARK) * 255).astype(np.uint8)
+    seeds = sorted(_line_seeds(dark, dpi), key=lambda t: t[1])
+    tracks = []
+    for x, y in seeds:
+        if any(abs(t_y(t, x) - y) < 8 for t in tracks):
+            continue
+        pts = sorted(_track_line(arr, x, y, -1) + _track_line(arr, x + TRACK_STEP, y, 1))
+        if pts and pts[-1][0] - pts[0][0] >= TRACK_MIN_SHARE * w:
+            tracks.append(pts)
+    if len(tracks) < 3:
+        return None
+    gx = np.arange(0, w + TRACK_GRID, TRACK_GRID)
+    gy = np.arange(0, h + TRACK_GRID, TRACK_GRID)
+    rows = []
+    for pts in tracks:
+        xs = np.array([p[0] for p in pts], np.float32)
+        ys = np.array([p[1] for p in pts], np.float32)
+        ref = float(np.median(ys))
+        rows.append((ref, np.interp(gx, xs, ys), xs[0], xs[-1]))
+    rows.sort(key=lambda r: r[0])
+    grid = np.empty((len(gy), len(gx)), np.float32)
+    for j, x in enumerate(gx):
+        # только линии, что доходят до этого столбца: за концом линии её высота ничего не говорит
+        here = [(r[0], r[1][j]) for r in rows if r[2] - TRACK_GRID <= x <= r[3] + TRACK_GRID]
+        if not here:
+            grid[:, j] = gy
+            continue
+        refs = np.array([a for a, _ in here])
+        off = np.array([b - a for a, b in here])
+        grid[:, j] = gy + np.interp(gy, refs, off)
+    grid = cv2.GaussianBlur(grid - gy[:, None].astype(np.float32), (0, 0), 2) + gy[:, None]
+    return cv2.resize(grid.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def t_y(track, x: float) -> float:
+    xs = [p[0] for p in track]
+    ys = [p[1] for p in track]
+    import numpy as np
+    return float(np.interp(x, xs, ys))
+
+
+def _line_seeds(dark, dpi: float):
+    """Середины длинных почти горизонтальных отрезков — откуда отслеживать линии."""
+    import cv2
+    import numpy as np
+    found = cv2.HoughLinesP(dark, 1, np.pi / 1800, threshold=int(dpi), minLineLength=int(dpi * 1.5),
+                            maxLineGap=int(dpi * 0.06))
+    out = []
+    if found is None:
+        return out
+    for x1, y1, x2, y2 in found.reshape(-1, 4).tolist():
+        if x2 != x1 and abs(y2 - y1) <= abs(x2 - x1) * 0.07:
+            out.append(((x1 + x2) // 2, (y1 + y2) // 2))
+    return out
+
+
+def straighten_rows(img: Image.Image, gray: Image.Image, dpi: float) -> tuple[Image.Image, Image.Image]:
+    import cv2
+    import numpy as np
+    field = curve_field(gray, dpi)
+    if field is None:
+        return img, gray
+    h, w = field.shape
+    map_x = np.tile(np.arange(w, dtype=np.float32), (h, 1))
+    out_gray = cv2.remap(np.asarray(gray), map_x, field, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                         borderValue=255)
+    out_img = cv2.remap(np.asarray(img), map_x, field, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(255, 255, 255))
+    return Image.fromarray(out_img), Image.fromarray(out_gray)
 
 
 def prepare_scan(page: pymupdf.Page, dpi: int | None = None, detect_orientation: bool = True) -> PreparedScan:
     from PIL import ImageFilter
 
     img, real_dpi = render_page(page, dpi or settings.ocr_dpi)
+    photo = photo_page_inches(page) is not None
+    if photo:
+        try:
+            img = flatten_light(img)
+        except Exception:
+            photo = False
     gray = img.convert("L").filter(ImageFilter.MedianFilter(3))  # убирает «соль и перец» скана
     rotation = detect_rotation(gray) if detect_orientation and tesseract_available() else 0
     if rotation:
@@ -1020,10 +1310,27 @@ def prepare_scan(page: pymupdf.Page, dpi: int | None = None, detect_orientation:
     if abs(skew) >= 0.1:
         img = img.rotate(skew, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
         gray = gray.rotate(skew, resample=Image.BICUBIC, fillcolor=255)
-    rules = detect_rules(gray, real_dpi)
+    if photo:
+        try:
+            img, gray = dewarp_photo(img, gray, real_dpi)
+            img, gray = straighten_rows(img, gray, real_dpi)
+        except Exception:
+            pass                         # выпрямление — улучшение, не повод терять страницу
+    ink = None
+    if photo:
+        try:
+            ink = colored_ink(img)       # серый порог снимка выше — печать и подпись сошли бы за линии
+        except Exception:
+            ink = None
+    rules = detect_rules(gray, real_dpi, photo=photo, ignore=ink)
     clean = erase_rules(gray, rules.h + rules.v + rules.free)
+    if photo:
+        try:
+            clean = erase_line_crumbs(clean, rules.h + rules.free, real_dpi, PHOTO_DARK)
+        except Exception:
+            pass
     if rules.combs:
-        clean = erase_comb_frames(clean, rules.combs)
+        clean = erase_comb_frames(clean, rules.combs, PHOTO_DARK if photo else 150)
     marks: list[Rect] = []
     try:
         ink = colored_ink(img)
@@ -1032,10 +1339,10 @@ def prepare_scan(page: pymupdf.Page, dpi: int | None = None, detect_orientation:
             clean = _erase_ink(clean, img, ink, marks, real_dpi)
     except Exception:          # печати — улучшение, не повод терять страницу
         marks = []
-    return PreparedScan(img, clean, real_dpi, rules.h, rules.v, rules.free, marks)
+    return PreparedScan(img, clean, real_dpi, rules.h, rules.v, rules.free, marks, rules.combs)
 
 
-def erase_comb_frames(gray: Image.Image, combs: list[Rect]) -> Image.Image:
+def erase_comb_frames(gray: Image.Image, combs: list[Rect], level: int = 150) -> Image.Image:
     """Стереть рамки клеток, оставив знаки в них: в каждой вырезке убирается самая большая связная
     область — сама рамка с перегородками."""
     import cv2
@@ -1043,17 +1350,19 @@ def erase_comb_frames(gray: Image.Image, combs: list[Rect]) -> Image.Image:
     arr = np.asarray(gray).copy()
     for x0, y0, x1, y1 in combs:
         x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
-        dark = (arr[y0:y1, x0:x1] < 150).astype(np.uint8)
+        dark = (arr[y0:y1, x0:x1] < level).astype(np.uint8)
         n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
         if n < 2:
             continue
         frame = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        ring = cv2.dilate((labels == frame).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        grow = 3 if level <= 150 else 7          # на снимке у рамки светлая кайма — стираем шире
+        ring = cv2.dilate((labels == frame).astype(np.uint8), np.ones((grow, grow), np.uint8)) > 0
         arr[y0:y1, x0:x1][ring] = 255
     return Image.fromarray(arr)
 
 
-def _erase_ink(gray: Image.Image, rgb: Image.Image, ink, marks: list[Rect], dpi: float) -> Image.Image:
+def _erase_ink(gray: Image.Image, rgb: Image.Image, ink, marks: list[Rect], dpi: float,
+               black_level: int = 110) -> Image.Image:
     """Стереть печати и подписи со скана для распознавания.
 
     Края штрихов цветных чернил светлее и почти серые — по насыщенности их не видно, а оставшиеся
@@ -1066,7 +1375,7 @@ def _erase_ink(gray: Image.Image, rgb: Image.Image, ink, marks: list[Rect], dpi:
     hsv = cv2.cvtColor(np.asarray(rgb.convert("RGB")), cv2.COLOR_RGB2HSV)
     k = max(3, int(dpi * 0.012)) | 1
     near = cv2.dilate(ink.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
-    black = (hsv[..., 2] < 110) & (hsv[..., 1] < 70)
+    black = (hsv[..., 2] < black_level) & (hsv[..., 1] < 70)   # на снимке «чёрный» светлее
     for x0, y0, x1, y1 in marks:
         x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
         zone = near[y0:y1, x0:x1] & ~black[y0:y1, x0:x1]
@@ -1146,10 +1455,187 @@ def add_cell_dashes(res: OcrResult, prep: PreparedScan) -> int:
     return added
 
 
-def apply_hocr(doc: pymupdf.Document, index: int, prep: PreparedScan, hocr: bytes | str) -> int:
+COMB_CHARS = "0123456789АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЭЮЯ"
+_COMB_DIGITS = str.maketrans({"О": "0", "о": "0", "З": "3", "з": "3", "Б": "6", "Ч": "4"})
+
+
+def _comb_clean(text: str) -> str:
+    text = re.sub(r"[^0-9A-ZА-ЯЁ]", "", text.upper())
+    if any(c.isdigit() for c in text) or (text and set(text) <= set("ОЗ")):
+        text = text.translate(_COMB_DIGITS)
+    return text
+
+
+def _comb_cells(rect: Rect) -> int | None:
+    ratio = (rect[2] - rect[0]) / max(rect[3] - rect[1], 1)
+    return round(ratio) if abs(ratio - round(ratio)) <= 0.3 else None
+
+
+def read_combs(prep: PreparedScan, lang: str) -> dict[Rect, list[str]]:
+    """Каждая группа клеток («[5][9]», «[2][0][2][6]») читается отдельно, как одно слово, —
+    несколькими способами (слово/строка, 1× и 2×); выбор — в put_combs голосованием вместе с общим
+    проходом.
+
+    Знаки в клетках стоят вразрядку, и на снимке Tesseract по всей странице читал их со стенками и
+    разрывами («[519]», «92/904)»), а на скане общий проход бывает верен, а отдельное чтение
+    ошибается («00» → «60»). Только с локальным Tesseract (в браузере группы читает общий проход)."""
+    out: dict[Rect, list[str]] = {}
+    for rect in prep.combs:
+        x0, y0, x1, y1 = rect
+        inset = max(3, int((y1 - y0) * 0.08))
+        crop = prep.clean.crop((int(x0) + inset, int(y0) + inset, int(x1) - inset, int(y1) - inset))
+        bw = crop.point(lambda v: 0 if v < 170 else 255)
+        found = []
+        for psm, scale in (("8", 1), ("8", 2), ("7", 1), ("7", 2)):
+            im = bw.resize((bw.width * scale, bw.height * scale), Image.LANCZOS) if scale > 1 else bw
+            pad = Image.new("L", (im.width + 40, im.height + 40), 255)
+            pad.paste(im, (20, 20))
+            try:
+                raw = _run_tesseract(_png(pad), ["-l", lang, "--dpi", str(int(prep.dpi * scale)), "--psm", psm,
+                                                 "-c", f"tessedit_char_whitelist={COMB_CHARS}"])
+            except Exception:
+                continue
+            found.append(_comb_clean(raw.decode("utf-8", "ignore")))
+        out[rect] = found
+    return out
+
+
+COMB_PRIMARY = 3          # общий проход и чтение «словом» (1× и 2×); «строкой» — запасное:
+                          # оно чаще путает последнюю цифру («0076» → «0070»)
+
+
+def vote_comb(rect: Rect, candidates: list[str]) -> str | None:
+    """Чтение группы: самое частое из прочтений с числом знаков, равным числу клеток (при равенстве —
+    раньше в списке: общий проход, затем «слово 1×»); прочтения «строкой» — только если среди
+    основных подходящих нет."""
+    cells = _comb_cells(rect)
+
+    def fits(c: str) -> bool:
+        return bool(c) and (cells is None or len(c) == cells)
+
+    for group in (candidates[:COMB_PRIMARY], candidates):
+        good = [c for c in group if fits(c)]
+        if good:
+            return max(good, key=lambda c: (good.count(c), -good.index(c)))
+    rest = [c for c in candidates if c]
+    return rest[0] if rest else None
+
+
+def comb_dashes(prep: PreparedScan) -> list[Rect]:
+    """Чёрточки между группами клеток («РФ - 59 - 2»): короткий тёмный штрих посередине промежутка."""
+    import numpy as np
+    arr = np.asarray(prep.clean)
+    out = []
+    rows: list[list[Rect]] = []
+    for r in sorted(prep.combs, key=lambda r: r[0]):
+        for row in rows:
+            if abs((row[-1][1] + row[-1][3]) / 2 - (r[1] + r[3]) / 2) < 0.4 * (r[3] - r[1]):
+                row.append(r)
+                break
+        else:
+            rows.append([r])
+    for row in rows:
+        for a, b in zip(row, row[1:]):
+            gx0, gx1 = int(a[2]) + 2, int(b[0]) - 2
+            if gx1 - gx0 < 4 or gx1 - gx0 > 3 * (a[3] - a[1]):
+                continue
+            gy0, gy1 = int(max(a[1], b[1])), int(min(a[3], b[3]))
+            dark = arr[gy0:gy1, gx0:gx1] < 170
+            ys, xs = np.nonzero(dark)
+            if len(xs) < 4:
+                continue
+            w, hgt = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+            if w >= 1.5 * hgt and hgt <= 0.25 * (gy1 - gy0):
+                out.append((gx0 + xs.min(), gy0 + ys.min(), gx0 + xs.max() + 1, gy0 + ys.max() + 1))
+    return out
+
+
+def put_combs(res: OcrResult, combs: dict[Rect, list[str] | str]) -> None:
+    """Слова, распознанные внутри групп клеток, заменяются прочитанными по группам (голосование
+    отдельных прочтений и общего прохода); «-» между группами — как есть."""
+    if not combs:
+        return
+
+    def within(w: Word, r: Rect) -> bool:
+        cx, cy = (w.x0 + w.x1) / 2, (w.y0 + w.y1) / 2
+        return r[0] - 4 <= cx <= r[2] + 4 and r[1] - 4 <= cy <= r[3] + 4
+
+    words = [w for p in res.paragraphs for ln in p.lines for w in ln.words]
+    boxes = [r for r, c in combs.items() if not isinstance(c, str)]
+    # общий проход: слово «-59-2-00-0-» на несколько групп делится по чёрточкам между группами
+    full: dict[Rect, str] = {}
+    for w in sorted(words, key=lambda w: w.x0):
+        cy = (w.y0 + w.y1) / 2
+        over = sorted((r for r in boxes if r[1] - 4 <= cy <= r[3] + 4 and min(w.x1, r[2]) - max(w.x0, r[0]) > 0),
+                      key=lambda r: r[0])
+        if not over:
+            continue
+        parts = [p for p in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", w.text) if p]
+        if len(over) == 1:
+            full[over[0]] = full.get(over[0], "") + "".join(parts)
+        elif len(parts) == len(over):
+            for r, part in zip(over, parts):
+                full[r] = full.get(r, "") + part
+    chosen: dict[Rect, str] = {}
+    for r, cand in combs.items():
+        if isinstance(cand, str):
+            chosen[r] = cand
+            continue
+        text = vote_comb(r, [_comb_clean(full.get(r, ""))] + list(cand))
+        if text:
+            chosen[r] = text
+    combs = chosen
+    if not combs:
+        return
+    rects = list(combs)
+
+    def inside(w: Word) -> bool:
+        """Слово внутри группы или поперёк нескольких групп («-2-0О-»)."""
+        cy = (w.y0 + w.y1) / 2
+        over = [min(w.x1, r[2]) - max(w.x0, r[0]) for r in rects if r[1] - 4 <= cy <= r[3] + 4]
+        over = [o for o in over if o > 0]
+        return any(within(w, r) for r in rects) or len(over) >= 2 or sum(over) >= 0.4 * max(w.x1 - w.x0, 1)
+
+    placed = set()
+    for para in res.paragraphs:
+        for ln in para.lines:
+            hit = [r for r in rects if r not in placed and min(ln.bbox[3], r[3]) - max(ln.bbox[1], r[1]) > 0.4 * (r[3] - r[1])]
+            ln.words = [w for w in ln.words if not inside(w)]
+            for r in hit:
+                ln.words.append(Word(combs[r], r[0], r[1], r[2], r[3], 95.0))
+                placed.add(r)
+            if hit:
+                ln.words.sort(key=lambda w: w.x0)
+    left = [r for r in rects if r not in placed]
+    if left:                                   # строку номера Tesseract мог не найти совсем
+        y0, y1 = min(r[1] for r in left), max(r[3] for r in left)
+        words = [Word(combs[r], r[0], r[1], r[2], r[3], 95.0) for r in sorted(left)]
+        res.paragraphs.append(Paragraph([Line((min(r[0] for r in left), y0, max(r[2] for r in left), y1),
+                                              y1, (y1 - y0) * 0.5, words)]))
+
+
+MARK_MIN_CONF = 70        # под печатью и подписью неуверенное слово — обрывки штрихов («Pte,», «axe»)
+
+
+def drop_unsure_in_marks(res: OcrResult, marks: list[Rect]) -> None:
+    if not marks:
+        return
+    for para in res.paragraphs:
+        for ln in para.lines:
+            ln.words = [w for w in ln.words if w.conf >= MARK_MIN_CONF or not _inside(
+                (w.x0 + w.x1) / 2, (w.y0 + w.y1) / 2, marks)]
+
+
+def apply_hocr(doc: pymupdf.Document, index: int, prep: PreparedScan, hocr: bytes | str,
+               combs: dict | None = None) -> int:
     """Заменяет страницу index на собранную из hOCR. Возвращает число слов;
     0 — страница оказалась иллюстрацией и оставлена как есть (картинкой)."""
     res = parse_hocr(hocr)
+    try:
+        put_combs(res, combs or {})
+    except Exception:
+        pass
+    drop_unsure_in_marks(res, prep.marks)
     if looks_like_picture(res, prep.img.width, prep.img.height):
         return 0
     try:
@@ -1168,7 +1654,14 @@ def ocr_replace_page(doc: pymupdf.Document, index: int, lang: str, dpi: int | No
     """Распознаёт страницу локальным Tesseract и заменяет её. Возвращает число слов."""
     prep = prepare_scan(doc[index], dpi)
     hocr = _run_tesseract(scan_png(prep), ["-l", lang, "--dpi", str(int(prep.dpi)), "--psm", "3", "hocr"])
-    return apply_hocr(doc, index, prep, hocr)
+    try:
+        combs = read_combs(prep, lang) if prep.combs else {}
+        if combs:
+            for dash in comb_dashes(prep):
+                combs[dash] = "-"
+    except Exception:
+        combs = {}
+    return apply_hocr(doc, index, prep, hocr, combs)
 
 
 # --------------------------------------------------------------------------- номера страниц
