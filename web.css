@@ -1,0 +1,12 @@
+/* Дополнения к styles.css для браузерной версии */
+.boot { margin: 18px auto 0; max-width: 380px; display: grid; gap: 7px; justify-items: center; font-size: 13px; color: var(--muted); }
+.boot-bar { width: 100%; height: 6px; border-radius: 99px; background: #e6eaf2; overflow: hidden; }
+.boot-bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .3s ease; }
+.boot.is-ready { color: var(--ok); }
+.boot.is-ready .boot-bar { display: none; }
+.boot.is-error { color: var(--err); }
+.boot.is-error .boot-bar i { background: var(--err); }
+.boot-side { margin: 14px 0 0; max-width: none; justify-items: stretch; text-align: center; }
+.first-run { color: #98a2b3; font-size: 13px; margin: 26px 0 0; }
+.foot { text-align: center; color: #98a2b3; font-size: 13px; padding: 18px 16px 26px; }
+.foot a { color: var(--muted); }

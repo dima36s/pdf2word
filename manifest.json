@@ -1,0 +1,23 @@
+{
+  "version": "a520e37",
+  "pyodide_packages": [
+    "numpy",
+    "opencv-python",
+    "lxml",
+    "pillow",
+    "pymupdf",
+    "fonttools",
+    "typing-extensions"
+  ],
+  "wheels": [
+    "wheels/et_xmlfile-2.0.0-py3-none-any.whl",
+    "wheels/openpyxl-3.1.5-py2.py3-none-any.whl",
+    "wheels/pdf2docx-0.5.13-py3-none-any.whl",
+    "wheels/python_docx-1.2.0-py3-none-any.whl"
+  ],
+  "app_zip": "app.zip",
+  "fonts": {
+    "LiberationSerif-Regular.ttf": "fonts/LiberationSerif-Regular.ttf",
+    "LiberationSerif-Bold.ttf": "fonts/LiberationSerif-Bold.ttf"
+  }
+}
